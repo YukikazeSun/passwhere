@@ -1,10 +1,17 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { fileURLToPath, URL } from "node:url";
 
 const host = process.env.TAURI_DEV_HOST;
 
 export default defineConfig({
   plugins: [react()],
+  resolve: {
+    alias: {
+      // The browser-only bundle keeps the same Workbook/XLSX API without Node adapters.
+      exceljs: fileURLToPath(new URL("./node_modules/exceljs/dist/exceljs.bare.min.js", import.meta.url)),
+    },
+  },
   clearScreen: false,
   server: {
     port: 1422,

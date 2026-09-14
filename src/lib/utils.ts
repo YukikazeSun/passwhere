@@ -14,6 +14,13 @@ export interface ServiceSearchResult {
   match: ServiceSearchMatch | null;
 }
 
+export interface ServiceSearchIndex {
+  accountsByServiceId: ReadonlyMap<Id, readonly AccountRecord[]>;
+  categoryPathById: ReadonlyMap<Id, string>;
+  childCategoryIdsByParentId: ReadonlyMap<Id, readonly Id[]>;
+  tagNameById: ReadonlyMap<Id, string>;
+}
+
 export const createId = (prefix: string) =>
   `${prefix}-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`;
 
@@ -44,20 +51,31 @@ export const getInitials = (name: string) => {
   return (latin || trimmed.slice(0, 1)).toUpperCase();
 };
 
-export function getCategoryPath(categoryId: Id | null, categories: Category[]) {
+function getCategoryPathFromIndex(categoryId: Id | null, categoryById: ReadonlyMap<Id, Category>) {
   if (!categoryId) return "未分类";
-  const index = new Map(categories.map((category) => [category.id, category]));
   const names: string[] = [];
   const visited = new Set<Id>();
-  let cursor = index.get(categoryId);
+  let cursor = categoryById.get(categoryId);
 
   while (cursor && !visited.has(cursor.id)) {
     names.unshift(cursor.name);
     visited.add(cursor.id);
-    cursor = cursor.parentId ? index.get(cursor.parentId) : undefined;
+    cursor = cursor.parentId ? categoryById.get(cursor.parentId) : undefined;
   }
 
   return names.join(" / ") || "未分类";
+}
+
+export function getCategoryPath(categoryId: Id | null, categories: Category[]) {
+  return getCategoryPathFromIndex(categoryId, new Map(categories.map((category) => [category.id, category])));
+}
+
+export function createCategoryPathIndex(categories: Category[]) {
+  const categoryById = new Map(categories.map((category) => [category.id, category]));
+  return new Map(categories.map((category) => [
+    category.id,
+    getCategoryPathFromIndex(category.id, categoryById),
+  ]));
 }
 
 const normalizeSearchText = (value: string) => value.toLocaleLowerCase("zh-CN");
@@ -71,43 +89,67 @@ function createSearchPreview(value: string, keyword: string) {
   return `${start > 0 ? "…" : ""}${excerpt}${start + 44 < compact.length ? "…" : ""}`;
 }
 
-export function findServiceSearchResults(
-  services: ServiceRecord[],
+export function createServiceSearchIndex(
   accounts: AccountRecord[],
   categories: Category[],
   tags: Tag[],
+): ServiceSearchIndex {
+  const accountsByServiceId = new Map<Id, AccountRecord[]>();
+  for (const account of accounts) {
+    const list = accountsByServiceId.get(account.serviceId);
+    if (list) list.push(account);
+    else accountsByServiceId.set(account.serviceId, [account]);
+  }
+  for (const serviceAccounts of accountsByServiceId.values()) {
+    serviceAccounts.sort((left, right) => left.sortOrder - right.sortOrder);
+  }
+
+  const categoryPathById = createCategoryPathIndex(categories);
+  const childCategoryIdsByParentId = new Map<Id, Id[]>();
+  for (const category of categories) {
+    if (!category.parentId) continue;
+    const children = childCategoryIdsByParentId.get(category.parentId);
+    if (children) children.push(category.id);
+    else childCategoryIdsByParentId.set(category.parentId, [category.id]);
+  }
+
+  return {
+    accountsByServiceId,
+    categoryPathById,
+    childCategoryIdsByParentId,
+    tagNameById: new Map(tags.map((tag) => [tag.id, tag.name])),
+  };
+}
+
+function getVisibleCategoryIds(categoryId: Id | "all", index: ServiceSearchIndex) {
+  const visibleCategoryIds = new Set<Id>();
+  if (categoryId === "all") return visibleCategoryIds;
+
+  const pending = [categoryId];
+  while (pending.length > 0) {
+    const currentId = pending.pop()!;
+    if (visibleCategoryIds.has(currentId)) continue;
+    visibleCategoryIds.add(currentId);
+    pending.push(...(index.childCategoryIdsByParentId.get(currentId) || []));
+  }
+  return visibleCategoryIds;
+}
+
+export function findIndexedServiceSearchResults(
+  services: ServiceRecord[],
+  index: ServiceSearchIndex,
   search: string,
   categoryId: Id | "all",
   selectedTagIds: Set<Id>,
 ) : ServiceSearchResult[] {
   const keyword = normalizeSearchText(search.trim());
-  const tagIndex = new Map(tags.map((tag) => [tag.id, tag.name]));
-  const visibleCategoryIds = new Set<Id>();
-  if (categoryId !== "all") {
-    visibleCategoryIds.add(categoryId);
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const category of categories) {
-        if (category.parentId && visibleCategoryIds.has(category.parentId) && !visibleCategoryIds.has(category.id)) {
-          visibleCategoryIds.add(category.id);
-          changed = true;
-        }
-      }
-    }
-  }
-  const accountIndex = new Map<Id, AccountRecord[]>();
-
-  for (const account of accounts) {
-    const list = accountIndex.get(account.serviceId) || [];
-    list.push(account);
-    accountIndex.set(account.serviceId, list);
-  }
+  const visibleCategoryIds = getVisibleCategoryIds(categoryId, index);
+  const requiredTagIds = [...selectedTagIds];
 
   const results: ServiceSearchResult[] = [];
   for (const service of services) {
     if (categoryId !== "all" && (!service.categoryId || !visibleCategoryIds.has(service.categoryId))) continue;
-    if (selectedTagIds.size > 0 && ![...selectedTagIds].every((id) => service.tagIds.includes(id))) {
+    if (requiredTagIds.length > 0 && !requiredTagIds.every((id) => service.tagIds.includes(id))) {
       continue;
     }
     if (!keyword) {
@@ -115,7 +157,7 @@ export function findServiceSearchResults(
       continue;
     }
 
-    const categoryPath = getCategoryPath(service.categoryId, categories);
+    const categoryPath = service.categoryId ? index.categoryPathById.get(service.categoryId) || "未分类" : "未分类";
     const makeMatch = (kind: ServiceSearchMatchKind, accountId: Id | null, label: string, value: string, prefix = ""): ServiceSearchResult => ({
       service,
       match: {
@@ -135,13 +177,15 @@ export function findServiceSearchResults(
     }
 
     let accountResult: ServiceSearchResult | null = null;
-    const serviceAccounts = [...(accountIndex.get(service.id) || [])].sort((left, right) => left.sortOrder - right.sortOrder);
+    const serviceAccounts = index.accountsByServiceId.get(service.id) || [];
     for (const account of serviceAccounts) {
       const accountPrefix = `${account.label} · `;
       const accountFields = [
         ["账号名称", account.label],
         ["登录账号", account.username],
         ["身份识别码", account.identityCode],
+        ["密保手机", account.securityPhone || ""],
+        ["密保邮箱", account.securityEmail || ""],
       ] as const;
       const directMatch = accountFields.find(([, value]) => normalizeSearchText(value).includes(keyword));
       if (directMatch) {
@@ -175,10 +219,28 @@ export function findServiceSearchResults(
       results.push(makeMatch("category", null, "分类", categoryPath));
       continue;
     }
-    const matchingTag = service.tagIds.map((id) => tagIndex.get(id) || "").find((name) => normalizeSearchText(name).includes(keyword));
+    const matchingTag = service.tagIds.map((id) => index.tagNameById.get(id) || "").find((name) => normalizeSearchText(name).includes(keyword));
     if (matchingTag) results.push(makeMatch("tag", null, "标签", matchingTag));
   }
   return results;
+}
+
+export function findServiceSearchResults(
+  services: ServiceRecord[],
+  accounts: AccountRecord[],
+  categories: Category[],
+  tags: Tag[],
+  search: string,
+  categoryId: Id | "all",
+  selectedTagIds: Set<Id>,
+) : ServiceSearchResult[] {
+  return findIndexedServiceSearchResults(
+    services,
+    createServiceSearchIndex(accounts, categories, tags),
+    search,
+    categoryId,
+    selectedTagIds,
+  );
 }
 
 export function filterServices(

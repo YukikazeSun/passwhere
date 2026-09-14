@@ -15,8 +15,9 @@ import { ALL_ACCOUNT_MODULES, CURRENT_DATA_VERSION } from "./dataModel";
 import { prepareImportData } from "./importValidation";
 
 const TEMPLATE_MARKER = "account-notebook-xlsx";
-const TEMPLATE_VERSION = 2;
+const TEMPLATE_VERSION = 3;
 const MEDIA_CHUNK_SIZE = 30_000;
+const MAX_MEDIA_CHUNKS = 702;
 const HEADER_FILL = "334155";
 const HEADER_TEXT = "FFFFFF";
 const ACCENT_FILL = "E8F1F2";
@@ -231,7 +232,7 @@ export async function exportExcel(data: AppData) {
     if (service.icon?.dataUrl) await addWorkbookImage(workbook, serviceSheet, service.icon.dataUrl, index + 2, 8, { width: 36, height: 36 });
   }
 
-  addTableSheet(workbook, "账号", ["账号编号", "所属分区编号", "账号名称", "登录账号", "当前密码", "身份识别码", "显示模块", "排序", "创建时间", "更新时间"], data.accounts.map((item) => [item.id, item.serviceId, item.label, item.username, item.password, item.identityCode, item.visibleModules.join(";"), item.sortOrder, item.createdAt, item.updatedAt]), [28, 28, 24, 28, 30, 38, 35, 10, 25, 25], 30);
+  addTableSheet(workbook, "账号", ["账号编号", "所属分区编号", "账号名称", "登录账号", "当前密码", "身份识别码", "密保手机", "密保邮箱", "显示模块", "排序", "创建时间", "更新时间"], data.accounts.map((item) => [item.id, item.serviceId, item.label, item.username, item.password, item.identityCode, item.securityPhone, item.securityEmail, item.visibleModules.join(";"), item.sortOrder, item.createdAt, item.updatedAt]), [28, 28, 24, 28, 30, 38, 20, 30, 35, 10, 25, 25], 30);
   addTableSheet(workbook, "历史密码", ["记录编号", "账号编号", "历史密码", "变更时间", "顺序"], data.accounts.flatMap((account) => account.passwordHistory.map((item, index) => [item.id, account.id, item.password, item.changedAt, index])), [28, 28, 32, 25, 10]);
   addTableSheet(workbook, "密保问题", ["记录编号", "账号编号", "问题", "回答", "顺序"], data.accounts.flatMap((account) => account.securityQuestions.map((item, index) => [item.id, account.id, item.question, item.answer, index])), [28, 28, 38, 38, 10], 30);
   addTableSheet(workbook, "自定义字段", ["记录编号", "账号编号", "字段名称", "字段内容", "多行显示", "允许复制", "顺序"], data.accounts.flatMap((account) => account.customFields.map((item, index) => [item.id, account.id, item.label, item.value, item.multiline ? "是" : "否", item.copyable ? "是" : "否", index])), [28, 28, 24, 48, 12, 12, 10], 30);
@@ -274,16 +275,25 @@ function parseMediaSheet(sheet: ExcelWorksheet): Map<string, ParsedMedia> {
     if (!id) return;
     const kind = cellText(row, headers, "类型");
     if (kind !== "service-icon" && kind !== "account-image") throw new Error(`图片“${id}”的类型无效`);
+    const chunkIndex = numberValue(cellText(row, headers, "分块序号"), -1);
+    const chunkTotal = numberValue(cellText(row, headers, "分块总数"), -1);
+    if (!Number.isSafeInteger(chunkIndex) || !Number.isSafeInteger(chunkTotal)
+      || chunkIndex < 0 || chunkTotal < 1 || chunkTotal > MAX_MEDIA_CHUNKS || chunkIndex >= chunkTotal) {
+      throw new Error(`图片“${id}”的分块编号无效`);
+    }
     const current = groups.get(id) || {
       kind,
       ownerId: cellText(row, headers, "所有者编号"),
       name: cellText(row, headers, "文件名"),
       sourceUrl: cellText(row, headers, "来源网址"),
       mime: cellText(row, headers, "MIME"),
-      total: numberValue(cellText(row, headers, "分块总数"), 1),
+      total: chunkTotal,
       chunks: new Map<number, string>(),
     };
-    current.chunks.set(numberValue(cellText(row, headers, "分块序号")), cellText(row, headers, "Base64数据"));
+    if (current.total !== chunkTotal || current.chunks.has(chunkIndex)) {
+      throw new Error(`图片“${id}”的分块数据重复或不一致`);
+    }
+    current.chunks.set(chunkIndex, cellText(row, headers, "Base64数据"));
     groups.set(id, current);
   });
   const result = new Map<string, ParsedMedia>();
@@ -314,7 +324,9 @@ function parseConfig(sheet: ExcelWorksheet) {
 function rowsByOwner<T>(items: Array<T & { ownerId: string; order: number }>) {
   const result = new Map<string, T[]>();
   items.sort((left, right) => left.order - right.order).forEach(({ ownerId, order: _order, ...item }) => {
-    result.set(ownerId, [...(result.get(ownerId) || []), item as T]);
+    const values = result.get(ownerId);
+    if (values) values.push(item as T);
+    else result.set(ownerId, [item as T]);
   });
   return result;
 }
@@ -396,6 +408,8 @@ export async function importExcel(bytes: ArrayBuffer, fileName: string, lastModi
       username: cellText(row, accountHeaders, "登录账号"),
       password: cellText(row, accountHeaders, "当前密码"),
       identityCode: cellText(row, accountHeaders, "身份识别码"),
+      securityPhone: cellText(row, accountHeaders, "密保手机"),
+      securityEmail: cellText(row, accountHeaders, "密保邮箱"),
       visibleModules: visible.length ? visible : [...ALL_ACCOUNT_MODULES],
       sortOrder: numberValue(cellText(row, accountHeaders, "排序"), index),
       securityQuestions: questions.get(id) || [],
@@ -432,6 +446,52 @@ function decodeBase64(base64: string) {
   return Uint8Array.from(binary, (character) => character.charCodeAt(0));
 }
 
+function imageDimensions(data: Uint8Array, type: "png" | "jpg" | "gif" | "bmp") {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  if (type === "png" && data.byteLength >= 24) {
+    return { width: view.getUint32(16), height: view.getUint32(20) };
+  }
+  if (type === "gif" && data.byteLength >= 10) {
+    return { width: view.getUint16(6, true), height: view.getUint16(8, true) };
+  }
+  if (type === "bmp" && data.byteLength >= 26) {
+    return { width: Math.abs(view.getInt32(18, true)), height: Math.abs(view.getInt32(22, true)) };
+  }
+  if (type === "jpg" && data.byteLength >= 4 && data[0] === 0xff && data[1] === 0xd8) {
+    let offset = 2;
+    while (offset + 8 < data.byteLength) {
+      if (data[offset] !== 0xff) {
+        offset += 1;
+        continue;
+      }
+      const marker = data[offset + 1];
+      if (marker === 0xd8 || marker === 0xd9) {
+        offset += 2;
+        continue;
+      }
+      const segmentLength = view.getUint16(offset + 2);
+      const isStartOfFrame = marker >= 0xc0 && marker <= 0xcf
+        && ![0xc4, 0xc8, 0xcc].includes(marker);
+      if (isStartOfFrame && segmentLength >= 7 && offset + 8 < data.byteLength) {
+        return { width: view.getUint16(offset + 7), height: view.getUint16(offset + 5) };
+      }
+      if (segmentLength < 2) break;
+      offset += segmentLength + 2;
+    }
+  }
+  return { width: 1, height: 1 };
+}
+
+function fitImage(width: number, height: number, maxWidth: number, maxHeight: number) {
+  const safeWidth = Math.max(1, width);
+  const safeHeight = Math.max(1, height);
+  const scale = Math.min(maxWidth / safeWidth, maxHeight / safeHeight, 1);
+  return {
+    width: Math.max(1, Math.round(safeWidth * scale)),
+    height: Math.max(1, Math.round(safeHeight * scale)),
+  };
+}
+
 async function imageForWord(image: StoredImage) {
   let parsed = parseDataUrl(image.dataUrl);
   const type = parsed.mime === "image/png" ? "png"
@@ -439,11 +499,15 @@ async function imageForWord(image: StoredImage) {
       : parsed.mime === "image/gif" ? "gif"
         : parsed.mime === "image/bmp" ? "bmp"
           : null;
-  if (type) return { type, data: decodeBase64(parsed.base64) } as const;
+  if (type) {
+    const data = decodeBase64(parsed.base64);
+    return { type, data, dimensions: imageDimensions(data, type) } as const;
+  }
   const converted = await convertDataUrlToPng(image.dataUrl);
   if (!converted) return null;
   parsed = parseDataUrl(converted);
-  return { type: "png" as const, data: decodeBase64(parsed.base64) };
+  const data = decodeBase64(parsed.base64);
+  return { type: "png" as const, data, dimensions: imageDimensions(data, "png") };
 }
 
 export async function exportWord(data: AppData) {
@@ -477,6 +541,7 @@ export async function exportWord(data: AppData) {
 
   const fieldTable = (rows: Array<[string, string]>) => new Table({
     width: { size: 9360, type: WidthType.DXA },
+    indent: { size: 120, type: WidthType.DXA },
     columnWidths: [2100, 7260],
     borders: {
       top: { style: BorderStyle.SINGLE, size: 4, color: BORDER_COLOR },
@@ -486,10 +551,13 @@ export async function exportWord(data: AppData) {
       insideHorizontal: { style: BorderStyle.SINGLE, size: 4, color: BORDER_COLOR },
       insideVertical: { style: BorderStyle.SINGLE, size: 4, color: BORDER_COLOR },
     },
-    rows: rows.map(([label, value]) => new TableRow({ children: [
-      new TableCell({ width: { size: 2100, type: WidthType.DXA }, shading: { type: ShadingType.CLEAR, fill: ACCENT_FILL }, children: [new Paragraph({ children: [new TextRun({ text: label, bold: true, color: "334155", size: 19 })] })] }),
-      new TableCell({ width: { size: 7260, type: WidthType.DXA }, children: [new Paragraph({ children: [new TextRun({ text: value || "-", size: 19 })] })] }),
-    ] })),
+    rows: rows.map(([label, value]) => new TableRow({
+      cantSplit: true,
+      children: [
+        new TableCell({ width: { size: 2100, type: WidthType.DXA }, shading: { type: ShadingType.CLEAR, fill: ACCENT_FILL }, children: [new Paragraph({ wordWrap: true, children: [new TextRun({ text: label, bold: true, color: "334155", size: 19 })] })] }),
+        new TableCell({ width: { size: 7260, type: WidthType.DXA }, children: [new Paragraph({ wordWrap: true, children: [new TextRun({ text: value || "-", size: 19 })] })] }),
+      ],
+    })),
   });
 
   for (let serviceIndex = 0; serviceIndex < data.services.length; serviceIndex += 1) {
@@ -505,7 +573,7 @@ export async function exportWord(data: AppData) {
       ["标签", service.tagIds.map((id) => tagById.get(id)).filter(Boolean).join("、") || "-"],
     ];
     paragraphs.push(fieldTable(metaRows));
-    if (service.url) paragraphs.push(new Paragraph({ children: [new TextRun({ text: "登录网址：", bold: true }), new ExternalHyperlink({ link: service.url, children: [new TextRun({ text: service.url, style: "Hyperlink" })] })], spacing: { before: 100, after: 100 } }));
+    if (service.url) paragraphs.push(new Paragraph({ wordWrap: true, children: [new TextRun({ text: "登录网址：", bold: true }), new ExternalHyperlink({ link: service.url, children: [new TextRun({ text: service.url, style: "Hyperlink" })] })], spacing: { before: 100, after: 100 } }));
     const icon = service.icon ? await imageForWord(service.icon) : null;
     if (icon && service.icon) paragraphs.push(new Paragraph({ children: [new ImageRun({ data: icon.data, transformation: { width: 52, height: 52 }, type: icon.type, altText: { title: service.icon.name, description: `${service.name} 分区图标`, name: service.icon.name } })], spacing: { after: 100 } }));
 
@@ -517,6 +585,8 @@ export async function exportWord(data: AppData) {
         ["登录账号", account.username],
         ["当前密码", account.password],
         ["身份识别码", account.identityCode],
+        ["密保手机", account.securityPhone || ""],
+        ["密保邮箱", account.securityEmail || ""],
       ]));
       if (account.securityQuestions.length) {
         paragraphs.push(new Paragraph({ text: "密保问题", heading: HeadingLevel.HEADING_3, spacing: { before: 160, after: 60 } }));
@@ -528,7 +598,7 @@ export async function exportWord(data: AppData) {
       }
       if (account.notes.length) {
         paragraphs.push(new Paragraph({ text: "备注", heading: HeadingLevel.HEADING_3, spacing: { before: 160, after: 60 } }));
-        account.notes.forEach((note) => paragraphs.push(new Paragraph({ children: [new TextRun({ text: `${note.title || "备注"}：`, bold: true }), new TextRun({ text: note.content || "-" })], spacing: { after: 70 } })));
+        account.notes.forEach((note) => paragraphs.push(new Paragraph({ wordWrap: true, children: [new TextRun({ text: `${note.title || "备注"}：`, bold: true }), new TextRun({ text: note.content || "-" })], spacing: { after: 70 } })));
       }
       if (account.passwordHistory.length) {
         paragraphs.push(new Paragraph({ text: "历史密码", heading: HeadingLevel.HEADING_3, spacing: { before: 160, after: 60 } }));
@@ -540,8 +610,9 @@ export async function exportWord(data: AppData) {
         wordImages.forEach(({ image, payload }) => {
           if (!payload) return;
           paragraphs.push(new Paragraph({ children: [new TextRun({ text: image.name, bold: true, size: 19 })], spacing: { before: 80, after: 40 }, keepNext: true }));
-          paragraphs.push(new Paragraph({ children: [new ImageRun({ data: payload.data, transformation: { width: 420, height: 260 }, type: payload.type, altText: { title: image.name, description: `${account.label} 的账号图片`, name: image.name } })], spacing: { after: 100 } }));
-          if (image.sourceUrl) paragraphs.push(new Paragraph({ children: [new ExternalHyperlink({ link: image.sourceUrl, children: [new TextRun({ text: image.sourceUrl, style: "Hyperlink", size: 18 })] })], spacing: { after: 80 } }));
+          const transformation = fitImage(payload.dimensions.width, payload.dimensions.height, 420, 480);
+          paragraphs.push(new Paragraph({ children: [new ImageRun({ data: payload.data, transformation, type: payload.type, altText: { title: image.name, description: `${account.label} 的账号图片`, name: image.name } })], spacing: { after: 100 } }));
+          if (image.sourceUrl) paragraphs.push(new Paragraph({ wordWrap: true, children: [new ExternalHyperlink({ link: image.sourceUrl, children: [new TextRun({ text: image.sourceUrl, style: "Hyperlink", size: 18 })] })], spacing: { after: 80 } }));
         });
       }
     }

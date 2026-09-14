@@ -69,7 +69,12 @@ export async function saveAppData(data: AppData): Promise<SaveResult> {
     return invokeTauri<SaveResult>("save_app_data", { data });
   }
   browserData = structuredClone(data);
-  return { dataDir: "浏览器演示存储", updatedAt: new Date().toISOString() };
+  return {
+    dataDir: "浏览器演示存储",
+    updatedAt: new Date().toISOString(),
+    data: structuredClone(browserData),
+    warnings: [],
+  };
 }
 
 export async function appendAudit(event: AuditEvent) {
@@ -102,8 +107,8 @@ export async function fetchRemoteImage(url: string) {
   return url;
 }
 
-export async function exportBackup(data: AppData) {
-  if (isTauri()) return invokeTauri<string>("export_backup", { data });
+export async function exportBackup(data: AppData, credential?: string) {
+  if (isTauri()) return invokeTauri<string>("export_backup", { data, credential: credential || null });
   throw new Error("加密备份仅在桌面程序中可用");
 }
 
@@ -213,7 +218,8 @@ function downloadBlob(blob: Blob, filename: string) {
   anchor.href = url;
   anchor.download = filename;
   anchor.click();
-  URL.revokeObjectURL(url);
+  // Let the browser start the download before releasing the object URL.
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 function generateBrowserRecoveryCode() {
@@ -229,16 +235,77 @@ function generateBrowserRecoveryCode() {
   return characters.join("");
 }
 
-export function readFileAsDataUrl(file: File) {
+export const MAX_IMAGE_FILE_BYTES = 15 * 1024 * 1024;
+
+const IMAGE_MIME_PATTERN = /^(image\/(png|jpeg|webp|gif|bmp|x-icon|vnd\.microsoft\.icon))$/i;
+
+function imageMimeFromFile(file: File) {
+  if (IMAGE_MIME_PATTERN.test(file.type)) return file.type.toLowerCase();
+  const filename = file.name.toLowerCase();
+  if (filename.endsWith(".ico")) return "image/x-icon";
+  if (filename.endsWith(".png")) return "image/png";
+  if (/\.jpe?g$/i.test(filename)) return "image/jpeg";
+  if (filename.endsWith(".webp")) return "image/webp";
+  if (filename.endsWith(".gif")) return "image/gif";
+  if (filename.endsWith(".bmp")) return "image/bmp";
+  return null;
+}
+
+function hasImageSignature(mime: string, bytes: Uint8Array) {
+  const startsWith = (...signature: number[]) => signature.every((value, index) => bytes[index] === value);
+  switch (mime) {
+    case "image/png": return startsWith(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a);
+    case "image/jpeg": return startsWith(0xff, 0xd8, 0xff);
+    case "image/webp": return startsWith(0x52, 0x49, 0x46, 0x46) && bytes.length >= 12 && String.fromCharCode(...bytes.slice(8, 12)) === "WEBP";
+    case "image/gif": return String.fromCharCode(...bytes.slice(0, 6)) === "GIF87a" || String.fromCharCode(...bytes.slice(0, 6)) === "GIF89a";
+    case "image/bmp": return startsWith(0x42, 0x4d);
+    case "image/x-icon":
+    case "image/vnd.microsoft.icon": return startsWith(0x00, 0x00, 0x01, 0x00);
+    default: return false;
+  }
+}
+
+const IMAGE_SIGNATURE_MIMES = [
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/gif",
+  "image/bmp",
+  "image/x-icon",
+] as const;
+
+function detectImageMime(bytes: Uint8Array) {
+  return IMAGE_SIGNATURE_MIMES.find((mime) => hasImageSignature(mime, bytes)) || null;
+}
+
+export async function validateImageFile(file: File) {
+  const displayName = file.name || "粘贴图片";
+  if (file.size > MAX_IMAGE_FILE_BYTES) {
+    throw new Error(`图片“${displayName}”超过 15 MB 限制`);
+  }
+  const declaredMime = imageMimeFromFile(file);
+  if (!declaredMime) throw new Error(`“${displayName}”不是支持的图片格式`);
+  const header = new Uint8Array(await file.slice(0, 12).arrayBuffer());
+  const detectedMime = detectImageMime(header);
+  if (!detectedMime) {
+    throw new Error(`图片“${displayName}”的内容与格式不匹配`);
+  }
+  return detectedMime;
+}
+
+export async function readFileAsDataUrl(file: File) {
+  const imageMime = await validateImageFile(file);
   return new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result));
+    reader.onload = () => {
+      const result = String(reader.result);
+      resolve(result.replace(/^data:[^;,]*;/, `data:${imageMime};`));
+    };
     reader.onerror = () => reject(reader.error);
     reader.readAsDataURL(file);
   });
 }
 
 export function isImageFile(file: File) {
-  const allowedMime = /^(image\/(png|jpeg|webp|gif|bmp|x-icon|vnd\.microsoft\.icon))$/i.test(file.type);
-  return allowedMime || /\.(ico|png|jpe?g|gif|webp|bmp)$/i.test(file.name);
+  return imageMimeFromFile(file) !== null;
 }

@@ -1,6 +1,6 @@
 [package]
 name = "account-notebook"
-version = "0.2.1"
+version = "0.4.0"
 description = "Windows portable local account information notebook"
 authors = ["Castbox AI Studio"]
 edition = "2021"

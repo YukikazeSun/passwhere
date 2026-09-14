@@ -63,6 +63,8 @@ export type AccountDisplayModule =
   | "username"
   | "password"
   | "identity"
+  | "securityPhone"
+  | "securityEmail"
   | "security"
   | "custom"
   | "notes"
@@ -81,6 +83,9 @@ export interface AccountRecord extends RecordVersion {
   username: string;
   password: string;
   identityCode: string;
+  /** Added after the initial data format; normalizers fill missing values. */
+  securityPhone?: string;
+  securityEmail?: string;
   notes: AccountNote[];
   visibleModules: AccountDisplayModule[];
   sortOrder: number;
@@ -115,6 +120,44 @@ export interface AppSyncMetadata {
   tombstones: DeletionTombstone[];
 }
 
+interface RecycleBinItemBase {
+  id: Id;
+  deletedAt: string;
+  type: SyncEntityType;
+  label: string;
+}
+
+export interface RecycledCategoryItem extends RecycleBinItemBase {
+  type: "category";
+  category: Category;
+  childCategoryIds: Id[];
+  serviceIds: Id[];
+}
+
+export interface RecycledTagItem extends RecycleBinItemBase {
+  type: "tag";
+  tag: Tag;
+  serviceIds: Id[];
+}
+
+export interface RecycledServiceItem extends RecycleBinItemBase {
+  type: "service";
+  service: ServiceRecord;
+  accounts: AccountRecord[];
+}
+
+export interface RecycledAccountItem extends RecycleBinItemBase {
+  type: "account";
+  serviceName: string;
+  account: AccountRecord;
+}
+
+export type RecycleBinItem =
+  | RecycledCategoryItem
+  | RecycledTagItem
+  | RecycledServiceItem
+  | RecycledAccountItem;
+
 export interface AppData {
   version: number;
   settings: AppSettings;
@@ -123,6 +166,7 @@ export interface AppData {
   tags: Tag[];
   services: ServiceRecord[];
   accounts: AccountRecord[];
+  recycleBin: RecycleBinItem[];
 }
 
 export interface AuditEvent {
@@ -137,6 +181,8 @@ export interface AuditEvent {
 export interface SaveResult {
   dataDir: string;
   updatedAt: string;
+  data: AppData;
+  warnings: string[];
 }
 
 export interface SecurityStatus {
@@ -159,6 +205,7 @@ export interface UnlockResult {
 export interface BackupInfo {
   startupLockEnabled: boolean;
   createdAt: string;
+  requiresCredential: boolean;
 }
 
 export interface ImportCounts {

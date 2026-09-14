@@ -1,13 +1,14 @@
 {
   "name": "account-notebook",
   "private": true,
-  "version": "0.2.1",
+  "version": "0.4.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "test": "vitest run",
+    "audit:office": "npm run build && powershell -ExecutionPolicy Bypass -File .\\scripts\\audit-office-bundle.ps1",
     "tauri": "tauri"
   },
   "dependencies": {
@@ -24,6 +25,7 @@
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^6.0.0",
+    "jszip": "^3.10.1",
     "typescript": "^5.9.0",
     "vite": "^8.1.5",
     "vitest": "^4.0.0"

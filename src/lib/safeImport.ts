@@ -11,12 +11,12 @@ export class SafeImportError extends Error {
   }
 }
 
-export async function replaceDataWithRollback(
+export async function replaceDataWithRollback<T>(
   currentData: AppData,
   importedData: AppData,
   operations: {
     createRollback: (data: AppData) => Promise<string>;
-    save: (data: AppData) => Promise<unknown>;
+    save: (data: AppData) => Promise<T>;
   },
 ) {
   let rollbackPath: string;
@@ -27,9 +27,9 @@ export async function replaceDataWithRollback(
   }
 
   try {
-    await operations.save(importedData);
+    const result = await operations.save(importedData);
+    return { rollbackPath, result };
   } catch (error) {
     throw new SafeImportError("save", String(error), rollbackPath);
   }
-  return rollbackPath;
 }

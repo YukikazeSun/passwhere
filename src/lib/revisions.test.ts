@@ -89,4 +89,31 @@ describe("prepareLocalMutation", () => {
       settingsModifiedByDeviceId: deviceId,
     });
   });
+
+  it("detects deletions in a large record set without changing tombstone semantics", () => {
+    const empty = createEmptyAppData(deviceId, firstTime);
+    const categories = Array.from({ length: 5_000 }, (_, index) => ({
+      ...category(`Category ${index}`),
+      id: `category-${index}`,
+      sortOrder: index,
+    }));
+    const added = prepareLocalMutation(empty, { ...empty, categories }, deviceId, firstTime);
+    const removedIds = new Set(["category-3", "category-1337", "category-4999"]);
+    const kept = added.categories.filter((item) => !removedIds.has(item.id));
+
+    const deleted = prepareLocalMutation(
+      added,
+      { ...added, categories: kept },
+      deviceId,
+      secondTime,
+    );
+
+    expect(deleted.categories).toHaveLength(4_997);
+    expect(deleted.sync.tombstones.map((item) => item.entityId)).toEqual([
+      "category-1337",
+      "category-3",
+      "category-4999",
+    ]);
+    expect(deleted.sync.tombstones.every((item) => item.revision === 2)).toBe(true);
+  });
 });

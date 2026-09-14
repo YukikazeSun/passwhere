@@ -50,6 +50,8 @@ export function describeAccountChanges(previous: AccountRecord, next: AccountRec
     if (previous.password) fields.push(next.passwordHistory.some((item) => item.password === previous.password) ? "旧密码已保留" : "旧密码未保留");
   }
   if (previous.identityCode !== next.identityCode) fields.push("身份识别码");
+  if (previous.securityPhone !== next.securityPhone) fields.push("密保手机");
+  if (previous.securityEmail !== next.securityEmail) fields.push("密保邮箱");
   if (!sameJson(previous.securityQuestions, next.securityQuestions)) fields.push("密保问题");
   if (!sameJson(previous.customFields, next.customFields)) fields.push("自定义字段");
   if (!sameJson(previous.notes, next.notes)) fields.push("备注");

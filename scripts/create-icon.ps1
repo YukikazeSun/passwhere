@@ -20,7 +20,7 @@ $Background.AddArc(412, 12, $Radius, $Radius, 270, 90)
 $Background.AddArc(412, 412, $Radius, $Radius, 0, 90)
 $Background.AddArc(12, 412, $Radius, $Radius, 90, 90)
 $Background.CloseFigure()
-$Graphics.FillPath((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(200, 79, 67))), $Background)
+$Graphics.FillPath((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(47, 111, 176))), $Background)
 
 $Page = New-Object System.Drawing.Drawing2D.GraphicsPath
 $Page.AddLine(92, 54, 338, 54)
@@ -30,7 +30,7 @@ $Page.AddLine(420, 454, 92, 454)
 $Page.CloseFigure()
 $Graphics.FillPath([System.Drawing.Brushes]::White, $Page)
 
-$FoldBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(239, 220, 215))
+$FoldBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(216, 232, 245))
 $Fold = New-Object System.Drawing.Drawing2D.GraphicsPath
 $Fold.AddLine(338, 54, 338, 136)
 $Fold.AddLine(338, 136, 420, 136)
@@ -42,7 +42,7 @@ $SpinePen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
 $SpinePen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
 $Graphics.DrawLine($SpinePen, 120, 96, 120, 412)
 
-$QuestionPen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(72, 75, 70)), 56
+$QuestionPen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(29, 41, 53)), 56
 $QuestionPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
 $QuestionPen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
 $Question = New-Object System.Drawing.Drawing2D.GraphicsPath
@@ -51,7 +51,7 @@ $Question.AddBezier(174, 198, 174, 104, 366, 104, 366, 210)
 $Question.AddBezier(366, 210, 366, 258, 272, 258, 272, 292)
 $Graphics.DrawPath($QuestionPen, $Question)
 
-$KeyholeBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(72, 75, 70))
+$KeyholeBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(29, 41, 53))
 $Graphics.FillEllipse($KeyholeBrush, 246, 362, 52, 52)
 $Graphics.FillRectangle($KeyholeBrush, 259, 398, 26, 26)
 

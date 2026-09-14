@@ -1,8 +1,10 @@
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Component, Path, PathBuf},
     sync::Mutex,
+    time::Duration,
 };
 
 use aes_gcm::{
@@ -13,7 +15,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use rand::{rngs::OsRng, seq::SliceRandom, RngCore};
-use reqwest::header::CONTENT_TYPE;
+use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -30,7 +32,8 @@ const NONCE_BYTES: usize = 12;
 const SALT_BYTES: usize = 16;
 const RECOVERY_CODE_LENGTH: usize = 16;
 const ENCRYPTED_FORMAT: &str = "encrypted-v1";
-const BACKUP_FORMAT: &str = "account-notebook-backup-v2";
+const BACKUP_FORMAT: &str = "account-notebook-backup-v3";
+const LEGACY_BACKUP_FORMAT: &str = "account-notebook-backup-v2";
 const IMAGE_ENCRYPTED_MAGIC: &[u8; 8] = b"ANBIMG1\0";
 const SYNC_LOCAL_FORMAT_VERSION: u32 = 1;
 
@@ -39,6 +42,8 @@ const SYNC_LOCAL_FORMAT_VERSION: u32 = 1;
 struct SaveResult {
     data_dir: String,
     updated_at: String,
+    data: Value,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +118,10 @@ struct BackupDocument {
     format: String,
     created_at: String,
     security: SecurityConfig,
+    #[serde(default)]
+    backup_credential_wrap: Option<KeyWrap>,
+    #[serde(default)]
+    local_only: bool,
     vault: EncryptedEnvelope,
 }
 
@@ -121,6 +130,7 @@ struct BackupDocument {
 struct BackupInfo {
     startup_lock_enabled: bool,
     created_at: String,
+    requires_credential: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -150,6 +160,7 @@ impl Drop for SecurityRuntime {
 
 struct SecurityState {
     runtime: Mutex<SecurityRuntime>,
+    save_gate: Mutex<()>,
 }
 
 fn data_directory() -> Result<PathBuf, String> {
@@ -294,6 +305,7 @@ fn initialize_security() -> Result<SecurityState, String> {
             data_key,
             unlocked_via_recovery: false,
         }),
+        save_gate: Mutex::new(()),
     })
 }
 
@@ -610,6 +622,56 @@ fn decode_database_payload(
     }
 }
 
+/// Verifies a freshly launched portable directory without changing its vault.
+/// This is intentionally exposed only to the native release smoke-test entrypoint.
+pub fn verify_first_run() -> Result<(), String> {
+    let security = initialize_security()?;
+    if security
+        .runtime
+        .lock()
+        .map_err(|_| "安全状态暂时不可用".to_string())?
+        .data_key
+        .is_none()
+    {
+        return Err("首次启动验收要求关闭启动密码".to_string());
+    }
+    let key = security
+        .runtime
+        .lock()
+        .map_err(|_| "安全状态暂时不可用".to_string())?
+        .data_key
+        .ok_or_else(|| "首次启动验收缺少自动解锁密钥".to_string())?;
+    let directory = data_directory()?;
+    let connection = open_database(&directory)?;
+    let payload = connection
+        .query_row("SELECT payload FROM app_state WHERE id = 1", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(error_string)?;
+    let (value, was_plaintext) = decode_database_payload(&payload, &key)?;
+    if was_plaintext {
+        return Err("首次启动数据库 payload 未使用加密格式".to_string());
+    }
+    if value.get("version").and_then(Value::as_u64).is_none() {
+        return Err("首次启动数据缺少有效版本号".to_string());
+    }
+    for field in ["categories", "tags", "services", "accounts", "recycleBin"] {
+        let is_empty_array = value
+            .get(field)
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty);
+        if !is_empty_array {
+            return Err(format!("首次启动数据的 {field} 不为空"));
+        }
+    }
+    if !value.get("settings").is_some_and(Value::is_object)
+        || !value.get("sync").is_some_and(Value::is_object)
+    {
+        return Err("首次启动数据缺少设置或同步元数据".to_string());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn get_sync_local_state() -> Result<SyncLocalState, String> {
     read_or_initialize_sync_local_state(&data_directory()?)
@@ -813,16 +875,42 @@ fn load_app_data(state: State<'_, SecurityState>) -> Result<Option<Value>, Strin
 }
 
 #[tauri::command]
-fn save_app_data(mut data: Value, state: State<'_, SecurityState>) -> Result<SaveResult, String> {
+fn save_app_data(data: Value, state: State<'_, SecurityState>) -> Result<SaveResult, String> {
+    let _save_guard = state
+        .save_gate
+        .lock()
+        .map_err(|_| "保存队列暂时不可用".to_string())?;
     let key = current_data_key(&state)?;
     let directory = data_directory()?;
-    let encrypt_images = image_encryption_enabled(&data);
-    materialize_media(&mut data, &directory, &key, encrypt_images)?;
+    persist_app_data(data, &directory, &key)
+}
+
+fn persist_app_data(
+    mut data: Value,
+    directory: &Path,
+    key: &[u8; DATA_KEY_BYTES],
+) -> Result<SaveResult, String> {
     let connection = open_database(&directory)?;
-    let updated_at = write_encrypted_payload(&connection, &data, &key)?;
+    let encrypt_images = image_encryption_enabled(&data);
+    let created_files = materialize_media(&mut data, directory, key, encrypt_images)?;
+    let mut persisted_data = data.clone();
+    strip_media_data_urls(&mut persisted_data);
+    let updated_at = match write_encrypted_payload(&connection, &persisted_data, key) {
+        Ok(updated_at) => updated_at,
+        Err(error) => {
+            remove_media_files(directory, &created_files);
+            return Err(error);
+        }
+    };
+    let warnings = cleanup_orphaned_media(&persisted_data, directory)
+        .err()
+        .map(|error| vec![format!("数据已保存，但旧图片清理失败：{error}")])
+        .unwrap_or_default();
     Ok(SaveResult {
         data_dir: directory.to_string_lossy().to_string(),
         updated_at,
+        data,
+        warnings,
     })
 }
 
@@ -885,6 +973,8 @@ fn fetch_remote_image(url: String) -> Result<String, String> {
     }
     let response = reqwest::blocking::Client::builder()
         .user_agent("AccountNotebook/0.1")
+        .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(20))
         .build()
         .map_err(error_string)?
         .get(parsed)
@@ -902,24 +992,84 @@ fn fetch_remote_image(url: String) -> Result<String, String> {
     if !allowed_image_mime(&mime) {
         return Err("仅支持 PNG、JPG、WebP、GIF、BMP 和 ICO 图片".to_string());
     }
-    let bytes = response.bytes().map_err(error_string)?;
+    if response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > REMOTE_IMAGE_LIMIT_BYTES as u64)
+    {
+        return Err("图片超过 15 MB 限制".to_string());
+    }
+    let mut bytes = Vec::new();
+    response
+        .take((REMOTE_IMAGE_LIMIT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(error_string)?;
     if bytes.len() > REMOTE_IMAGE_LIMIT_BYTES {
         return Err("图片超过 15 MB 限制".to_string());
     }
+    validate_image_signature(&mime, &bytes)?;
     Ok(format!("data:{mime};base64,{}", BASE64.encode(bytes)))
+}
+
+fn prepare_backup_security(
+    config: &SecurityConfig,
+    data_key: &[u8; DATA_KEY_BYTES],
+    backup_credential: Option<String>,
+    local_only: bool,
+) -> Result<(SecurityConfig, Option<KeyWrap>), String> {
+    let backup_credential_wrap = if local_only || config.startup_lock_enabled {
+        None
+    } else {
+        let credential = backup_credential
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "未启用启动密码时，导出备份必须设置备份密码".to_string())?;
+        if credential.chars().count() < 8 {
+            return Err("备份密码至少需要 8 个字符".to_string());
+        }
+        Some(wrap_data_key(&credential, data_key)?)
+    };
+    let security = if local_only || backup_credential_wrap.is_some() {
+        SecurityConfig {
+            format_version: config.format_version,
+            startup_lock_enabled: config.startup_lock_enabled,
+            automatic_key: None,
+            password_wrap: if local_only {
+                None
+            } else {
+                config.password_wrap.clone()
+            },
+            recovery_wrap: if local_only {
+                None
+            } else {
+                config.recovery_wrap.clone()
+            },
+        }
+    } else {
+        config.clone()
+    };
+    Ok((security, backup_credential_wrap))
 }
 
 fn write_backup_file(
     data: &Value,
     filename_prefix: &str,
     state: &State<'_, SecurityState>,
+    backup_credential: Option<String>,
+    local_only: bool,
 ) -> Result<String, String> {
     let key = current_data_key(&state)?;
     let directory = data_directory()?;
+    let config = read_security_config(&directory)?;
+    let (security, backup_credential_wrap) =
+        prepare_backup_security(&config, &key, backup_credential, local_only)?;
     let document = BackupDocument {
         format: BACKUP_FORMAT.to_string(),
         created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-        security: read_security_config(&directory)?,
+        security,
+        backup_credential_wrap,
+        local_only,
         vault: encrypt_bytes(&key, &serde_json::to_vec(&data).map_err(error_string)?)?,
     };
     let filename = format!(
@@ -937,13 +1087,17 @@ fn write_backup_file(
 }
 
 #[tauri::command]
-fn export_backup(data: Value, state: State<'_, SecurityState>) -> Result<String, String> {
-    write_backup_file(&data, "account-notebook", &state)
+fn export_backup(
+    data: Value,
+    credential: Option<String>,
+    state: State<'_, SecurityState>,
+) -> Result<String, String> {
+    write_backup_file(&data, "account-notebook", &state, credential, false)
 }
 
 #[tauri::command]
 fn create_rollback_backup(data: Value, state: State<'_, SecurityState>) -> Result<String, String> {
-    write_backup_file(&data, "rollback-before-import", &state)
+    write_backup_file(&data, "rollback-before-import", &state, None, true)
 }
 
 fn write_export_bytes(directory: &Path, file_name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
@@ -1004,7 +1158,7 @@ fn get_storage_stats() -> Result<StorageStats, String> {
 fn parse_backup(backup_text: &str) -> Result<BackupDocument, String> {
     let document: BackupDocument =
         serde_json::from_str(backup_text).map_err(|_| "备份文件格式无效".to_string())?;
-    if document.format != BACKUP_FORMAT {
+    if document.format != BACKUP_FORMAT && document.format != LEGACY_BACKUP_FORMAT {
         return Err("不支持的备份文件版本".to_string());
     }
     Ok(document)
@@ -1016,13 +1170,22 @@ fn inspect_backup(backup_text: String) -> Result<BackupInfo, String> {
     Ok(BackupInfo {
         startup_lock_enabled: document.security.startup_lock_enabled,
         created_at: document.created_at,
+        requires_credential: !document.local_only
+            && (document.security.startup_lock_enabled
+                || document.backup_credential_wrap.is_some()),
     })
 }
 
 #[tauri::command]
-fn decrypt_backup(backup_text: String, credential: Option<String>) -> Result<Value, String> {
+fn decrypt_backup(
+    backup_text: String,
+    credential: Option<String>,
+    state: State<'_, SecurityState>,
+) -> Result<Value, String> {
     let document = parse_backup(&backup_text)?;
-    let key = if document.security.startup_lock_enabled {
+    let key = if document.local_only {
+        current_data_key(&state)?
+    } else if document.security.startup_lock_enabled {
         let credential = credential
             .filter(|value| !value.is_empty())
             .ok_or_else(|| {
@@ -1041,6 +1204,11 @@ fn decrypt_backup(backup_text: String, credential: Option<String>) -> Result<Val
                     .and_then(|wrapped| unwrap_data_key(&credential, wrapped).ok())
             })
             .ok_or_else(|| "备份密码或恢复码不正确".to_string())?
+    } else if let Some(wrapped) = document.backup_credential_wrap.as_ref() {
+        let credential = credential
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "该导出备份需要输入备份密码".to_string())?;
+        unwrap_data_key(&credential, wrapped).map_err(|_| "备份密码不正确".to_string())?
     } else {
         document
             .security
@@ -1072,20 +1240,247 @@ fn materialize_media(
     directory: &Path,
     key: &[u8; DATA_KEY_BYTES],
     encrypt_images: bool,
+) -> Result<Vec<PathBuf>, String> {
+    let mut created_files = Vec::new();
+    let result = (|| -> Result<(), String> {
+        if let Some(services) = data.get_mut("services").and_then(Value::as_array_mut) {
+            for service in services {
+                materialize_service_media(
+                    service,
+                    directory,
+                    key,
+                    encrypt_images,
+                    &mut created_files,
+                )?;
+            }
+        }
+        if let Some(accounts) = data.get_mut("accounts").and_then(Value::as_array_mut) {
+            for account in accounts {
+                materialize_account_media(
+                    account,
+                    directory,
+                    key,
+                    encrypt_images,
+                    &mut created_files,
+                )?;
+            }
+        }
+        if let Some(items) = data.get_mut("recycleBin").and_then(Value::as_array_mut) {
+            for item in items {
+                match item.get("type").and_then(Value::as_str).unwrap_or("") {
+                    "service" => {
+                        if let Some(service) = item.get_mut("service") {
+                            materialize_service_media(
+                                service,
+                                directory,
+                                key,
+                                encrypt_images,
+                                &mut created_files,
+                            )?;
+                        }
+                        if let Some(accounts) =
+                            item.get_mut("accounts").and_then(Value::as_array_mut)
+                        {
+                            for account in accounts {
+                                materialize_account_media(
+                                    account,
+                                    directory,
+                                    key,
+                                    encrypt_images,
+                                    &mut created_files,
+                                )?;
+                            }
+                        }
+                    }
+                    "account" => {
+                        if let Some(account) = item.get_mut("account") {
+                            materialize_account_media(
+                                account,
+                                directory,
+                                key,
+                                encrypt_images,
+                                &mut created_files,
+                            )?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        remove_media_files(directory, &created_files);
+        return Err(error);
+    }
+    Ok(created_files)
+}
+
+fn materialize_service_media(
+    service: &mut Value,
+    directory: &Path,
+    key: &[u8; DATA_KEY_BYTES],
+    encrypt_images: bool,
+    created_files: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
+    if let Some(icon) = service.get_mut("icon") {
+        if let Some(path) = materialize_image(icon, directory, "icons", key, encrypt_images)? {
+            created_files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn materialize_account_media(
+    account: &mut Value,
+    directory: &Path,
+    key: &[u8; DATA_KEY_BYTES],
+    encrypt_images: bool,
+    created_files: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    if let Some(images) = account.get_mut("images").and_then(Value::as_array_mut) {
+        for image in images {
+            if let Some(path) = materialize_image(image, directory, "images", key, encrypt_images)?
+            {
+                created_files.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn strip_media_data_urls(data: &mut Value) {
     if let Some(services) = data.get_mut("services").and_then(Value::as_array_mut) {
         for service in services {
-            if let Some(icon) = service.get_mut("icon") {
-                materialize_image(icon, directory, "icons", key, encrypt_images)?;
-            }
+            strip_service_media_data_urls(service);
         }
     }
     if let Some(accounts) = data.get_mut("accounts").and_then(Value::as_array_mut) {
         for account in accounts {
-            if let Some(images) = account.get_mut("images").and_then(Value::as_array_mut) {
-                for image in images {
-                    materialize_image(image, directory, "images", key, encrypt_images)?;
+            strip_account_media_data_urls(account);
+        }
+    }
+    if let Some(items) = data.get_mut("recycleBin").and_then(Value::as_array_mut) {
+        for item in items {
+            match item.get("type").and_then(Value::as_str).unwrap_or("") {
+                "service" => {
+                    if let Some(service) = item.get_mut("service") {
+                        strip_service_media_data_urls(service);
+                    }
+                    if let Some(accounts) = item.get_mut("accounts").and_then(Value::as_array_mut) {
+                        for account in accounts {
+                            strip_account_media_data_urls(account);
+                        }
+                    }
                 }
+                "account" => {
+                    if let Some(account) = item.get_mut("account") {
+                        strip_account_media_data_urls(account);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn strip_service_media_data_urls(service: &mut Value) {
+    if let Some(icon) = service.get_mut("icon").and_then(Value::as_object_mut) {
+        icon.insert("dataUrl".to_string(), Value::String(String::new()));
+    }
+}
+
+fn strip_account_media_data_urls(account: &mut Value) {
+    if let Some(images) = account.get_mut("images").and_then(Value::as_array_mut) {
+        for image in images {
+            if let Some(object) = image.as_object_mut() {
+                object.insert("dataUrl".to_string(), Value::String(String::new()));
+            }
+        }
+    }
+}
+
+fn referenced_media_paths(data: &Value) -> HashSet<PathBuf> {
+    let mut paths = HashSet::new();
+    if let Some(services) = data.get("services").and_then(Value::as_array) {
+        for service in services {
+            collect_service_media_paths(service, &mut paths);
+        }
+    }
+    if let Some(accounts) = data.get("accounts").and_then(Value::as_array) {
+        for account in accounts {
+            collect_account_media_paths(account, &mut paths);
+        }
+    }
+    if let Some(items) = data.get("recycleBin").and_then(Value::as_array) {
+        for item in items {
+            match item.get("type").and_then(Value::as_str).unwrap_or("") {
+                "service" => {
+                    if let Some(service) = item.get("service") {
+                        collect_service_media_paths(service, &mut paths);
+                    }
+                    if let Some(accounts) = item.get("accounts").and_then(Value::as_array) {
+                        for account in accounts {
+                            collect_account_media_paths(account, &mut paths);
+                        }
+                    }
+                }
+                "account" => {
+                    if let Some(account) = item.get("account") {
+                        collect_account_media_paths(account, &mut paths);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    paths
+}
+
+fn collect_service_media_paths(service: &Value, paths: &mut HashSet<PathBuf>) {
+    if let Some(path) = service
+        .get("icon")
+        .and_then(|icon| icon.get("storedPath"))
+        .and_then(Value::as_str)
+        .and_then(|value| safe_media_path(value, "icons"))
+    {
+        paths.insert(path);
+    }
+}
+
+fn collect_account_media_paths(account: &Value, paths: &mut HashSet<PathBuf>) {
+    if let Some(images) = account.get("images").and_then(Value::as_array) {
+        for image in images {
+            if let Some(path) = image
+                .get("storedPath")
+                .and_then(Value::as_str)
+                .and_then(|value| safe_media_path(value, "images"))
+            {
+                paths.insert(path);
+            }
+        }
+    }
+}
+
+fn remove_media_files(directory: &Path, paths: &[PathBuf]) {
+    for path in paths {
+        let _ = fs::remove_file(directory.join(path));
+    }
+}
+
+fn cleanup_orphaned_media(data: &Value, directory: &Path) -> Result<(), String> {
+    let referenced = referenced_media_paths(data);
+    for subdirectory in ["images", "icons"] {
+        let media_directory = directory.join(subdirectory);
+        for entry in fs::read_dir(&media_directory).map_err(error_string)? {
+            let entry = entry.map_err(error_string)?;
+            let file_type = entry.file_type().map_err(error_string)?;
+            if file_type.is_symlink() || !file_type.is_file() {
+                continue;
+            }
+            let relative = PathBuf::from(subdirectory).join(entry.file_name());
+            if !referenced.contains(&relative) {
+                fs::remove_file(entry.path()).map_err(error_string)?;
             }
         }
     }
@@ -1098,12 +1493,12 @@ fn materialize_image(
     subdirectory: &str,
     key: &[u8; DATA_KEY_BYTES],
     encrypt_images: bool,
-) -> Result<(), String> {
+) -> Result<Option<PathBuf>, String> {
     if image.is_null() {
-        return Ok(());
+        return Ok(None);
     }
     let Some(object) = image.as_object_mut() else {
-        return Ok(());
+        return Ok(None);
     };
     let existing_relative = object
         .get("storedPath")
@@ -1130,51 +1525,64 @@ fn materialize_image(
         let extension = extension_for_mime(&mime);
         let matching_existing = existing_relative
             .filter(|path| path.extension().and_then(|value| value.to_str()) == Some(extension));
-        match matching_existing {
+        let (path, created) = match matching_existing {
             Some(path) if directory.join(&path).exists() => {
                 let absolute = directory.join(&path);
                 let (stored_bytes, was_encrypted) = read_media_plaintext(&absolute, key, &mime)?;
-                if stored_bytes == bytes {
-                    if was_encrypted != encrypt_images {
-                        let payload = encode_media_payload(key, &bytes, encrypt_images)?;
-                        replace_file_atomically(&absolute, &payload)?;
-                    }
-                    path
+                if stored_bytes == bytes && was_encrypted == encrypt_images {
+                    (path, false)
                 } else {
                     let path = unique_media_path(directory, subdirectory, &id, extension);
                     let payload = encode_media_payload(key, &bytes, encrypt_images)?;
                     write_new_file_atomically(&directory.join(&path), &payload)?;
-                    path
+                    (path, true)
                 }
             }
             _ => {
                 let path = unique_media_path(directory, subdirectory, &id, extension);
                 let payload = encode_media_payload(key, &bytes, encrypt_images)?;
                 write_new_file_atomically(&directory.join(&path), &payload)?;
-                path
+                (path, true)
             }
-        }
+        };
+        (path, created)
     } else if let Some(path) = existing_relative.filter(|path| directory.join(path).exists()) {
         let absolute = directory.join(&path);
         let mime = mime_for_path(&absolute);
         let (bytes, was_encrypted) = read_media_plaintext(&absolute, key, mime)?;
         if was_encrypted != encrypt_images {
+            let id = object
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("image")
+                .replace(
+                    |character: char| {
+                        !character.is_ascii_alphanumeric() && character != '-' && character != '_'
+                    },
+                    "_",
+                );
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("png");
+            let next_path = unique_media_path(directory, subdirectory, &id, extension);
             let payload = encode_media_payload(key, &bytes, encrypt_images)?;
-            replace_file_atomically(&absolute, &payload)?;
+            write_new_file_atomically(&directory.join(&next_path), &payload)?;
+            (next_path, true)
+        } else {
+            (path, false)
         }
-        path
     } else {
-        return Ok(());
+        return Ok(None);
     };
 
     if let Some(object) = image.as_object_mut() {
         object.insert(
             "storedPath".to_string(),
-            Value::String(relative.to_string_lossy().replace('\\', "/")),
+            Value::String(relative.0.to_string_lossy().replace('\\', "/")),
         );
-        object.insert("dataUrl".to_string(), Value::String(String::new()));
     }
-    Ok(())
+    Ok(relative.1.then_some(relative.0))
 }
 
 fn hydrate_media(
@@ -1185,18 +1593,60 @@ fn hydrate_media(
 ) -> Result<(), String> {
     if let Some(services) = data.get_mut("services").and_then(Value::as_array_mut) {
         for service in services {
-            if let Some(icon) = service.get_mut("icon") {
-                hydrate_image(icon, directory, "icons", key, encrypt_images)?;
-            }
+            hydrate_service_media(service, directory, key, encrypt_images)?;
         }
     }
     if let Some(accounts) = data.get_mut("accounts").and_then(Value::as_array_mut) {
         for account in accounts {
-            if let Some(images) = account.get_mut("images").and_then(Value::as_array_mut) {
-                for image in images {
-                    hydrate_image(image, directory, "images", key, encrypt_images)?;
+            hydrate_account_media(account, directory, key, encrypt_images)?;
+        }
+    }
+    if let Some(items) = data.get_mut("recycleBin").and_then(Value::as_array_mut) {
+        for item in items {
+            match item.get("type").and_then(Value::as_str).unwrap_or("") {
+                "service" => {
+                    if let Some(service) = item.get_mut("service") {
+                        hydrate_service_media(service, directory, key, encrypt_images)?;
+                    }
+                    if let Some(accounts) = item.get_mut("accounts").and_then(Value::as_array_mut) {
+                        for account in accounts {
+                            hydrate_account_media(account, directory, key, encrypt_images)?;
+                        }
+                    }
                 }
+                "account" => {
+                    if let Some(account) = item.get_mut("account") {
+                        hydrate_account_media(account, directory, key, encrypt_images)?;
+                    }
+                }
+                _ => {}
             }
+        }
+    }
+    Ok(())
+}
+
+fn hydrate_service_media(
+    service: &mut Value,
+    directory: &Path,
+    key: &[u8; DATA_KEY_BYTES],
+    encrypt_images: bool,
+) -> Result<(), String> {
+    if let Some(icon) = service.get_mut("icon") {
+        hydrate_image(icon, directory, "icons", key, encrypt_images)?;
+    }
+    Ok(())
+}
+
+fn hydrate_account_media(
+    account: &mut Value,
+    directory: &Path,
+    key: &[u8; DATA_KEY_BYTES],
+    encrypt_images: bool,
+) -> Result<(), String> {
+    if let Some(images) = account.get_mut("images").and_then(Value::as_array_mut) {
+        for image in images {
+            hydrate_image(image, directory, "images", key, encrypt_images)?;
         }
     }
     Ok(())
@@ -1523,7 +1973,7 @@ fn rotate_log_if_needed(path: &Path) -> Result<(), String> {
         kept_bytes += line_bytes;
     }
     kept.reverse();
-    fs::write(path, format!("{}\n", kept.join("\n"))).map_err(error_string)
+    replace_file_atomically(path, format!("{}\n", kept.join("\n")).as_bytes())
 }
 
 fn error_string(error: impl std::fmt::Display) -> String {
@@ -1547,6 +1997,104 @@ mod tests {
     }
 
     #[test]
+    fn large_text_vault_persists_and_round_trips() {
+        let test_directory = test_directory("large-vault-test");
+        fs::create_dir_all(test_directory.join("images")).unwrap();
+        fs::create_dir_all(test_directory.join("icons")).unwrap();
+        let key = random_data_key();
+        let services = (0..2_000)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("service-{index}"),
+                    "name": format!("Service {index}"),
+                    "url": format!("https://example.com/{index}"),
+                    "categoryId": null,
+                    "tagIds": [],
+                    "icon": null,
+                    "sortOrder": index
+                })
+            })
+            .collect::<Vec<_>>();
+        let accounts = (0..6_000)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("account-{index}"),
+                    "serviceId": format!("service-{}", index / 3),
+                    "label": format!("Account {index}"),
+                    "username": format!("user-{index}@example.com"),
+                    "password": format!("Password-{index}!"),
+                    "identityCode": format!("Identity-{index}"),
+                    "notes": [{
+                        "id": format!("note-{index}"),
+                        "title": "Note",
+                        "content": format!("Long local note {index}")
+                    }],
+                    "customFields": [{
+                        "id": format!("field-{index}"),
+                        "label": "License",
+                        "value": format!("Value-{index}"),
+                        "multiline": false,
+                        "copyable": true
+                    }],
+                    "securityQuestions": [],
+                    "images": [],
+                    "passwordHistory": [],
+                    "sortOrder": index % 3
+                })
+            })
+            .collect::<Vec<_>>();
+        let data = serde_json::json!({
+            "version": 5,
+            "settings": { "encryptImages": false },
+            "services": services,
+            "accounts": accounts
+        });
+
+        let result = persist_app_data(data, &test_directory, &key).unwrap();
+        assert!(result.warnings.is_empty());
+        let connection = open_database(&test_directory).unwrap();
+        let payload = connection
+            .query_row("SELECT payload FROM app_state WHERE id = 1", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap();
+        let (stored, was_plaintext) = decode_database_payload(&payload, &key).unwrap();
+        assert!(!was_plaintext);
+        assert_eq!(stored["services"].as_array().unwrap().len(), 2_000);
+        assert_eq!(stored["accounts"].as_array().unwrap().len(), 6_000);
+        assert_eq!(
+            stored["accounts"][5_999]["notes"][0]["content"],
+            "Long local note 5999"
+        );
+        assert!(!payload.contains("Password-5999!"));
+        drop(connection);
+        fs::remove_dir_all(test_directory).unwrap();
+    }
+
+    #[test]
+    fn oversized_audit_log_keeps_the_latest_complete_lines() {
+        let test_directory = test_directory("audit-rotation-test");
+        fs::create_dir_all(&test_directory).unwrap();
+        let path = test_directory.join("audit.log");
+        let padding = "x".repeat(4_096);
+        let mut content = String::new();
+        for index in 0..2_600 {
+            content.push_str(&format!("event-{index:04}-{padding}\n"));
+        }
+        fs::write(&path, content).unwrap();
+        assert!(fs::metadata(&path).unwrap().len() > LOG_LIMIT_BYTES);
+
+        rotate_log_if_needed(&path).unwrap();
+
+        let rotated = fs::read_to_string(&path).unwrap();
+        assert!(fs::metadata(&path).unwrap().len() <= LOG_TRIM_TARGET_BYTES as u64);
+        assert!(!rotated.contains("event-0000-"));
+        assert!(rotated.contains("event-2599-"));
+        assert!(rotated.ends_with('\n'));
+        fs::remove_dir_all(test_directory).unwrap();
+    }
+
+    #[test]
     fn encrypted_envelope_round_trips_and_rejects_wrong_key() {
         let key = random_data_key();
         let wrong_key = random_data_key();
@@ -1565,6 +2113,64 @@ mod tests {
             key
         );
         assert!(unwrap_data_key("wrong password", &wrapped).is_err());
+    }
+
+    #[test]
+    fn portable_backup_without_startup_lock_uses_a_separate_credential_wrap() {
+        let key = random_data_key();
+        let config = SecurityConfig {
+            format_version: 1,
+            startup_lock_enabled: false,
+            automatic_key: Some(BASE64.encode(key)),
+            password_wrap: None,
+            recovery_wrap: None,
+        };
+
+        let (security, backup_wrap) =
+            prepare_backup_security(&config, &key, Some("portable-backup".to_string()), false)
+                .unwrap();
+
+        assert!(security.automatic_key.is_none());
+        assert!(backup_wrap.is_some());
+        assert_eq!(
+            unwrap_data_key("portable-backup", backup_wrap.as_ref().unwrap()).unwrap(),
+            key
+        );
+        assert!(unwrap_data_key("wrong-password", backup_wrap.as_ref().unwrap()).is_err());
+    }
+
+    #[test]
+    fn local_rollback_backup_does_not_embed_any_unlock_secret() {
+        let key = random_data_key();
+        let config = SecurityConfig {
+            format_version: 1,
+            startup_lock_enabled: false,
+            automatic_key: Some(BASE64.encode(key)),
+            password_wrap: None,
+            recovery_wrap: None,
+        };
+
+        let (security, backup_wrap) = prepare_backup_security(&config, &key, None, true).unwrap();
+
+        assert!(security.automatic_key.is_none());
+        assert!(security.password_wrap.is_none());
+        assert!(security.recovery_wrap.is_none());
+        assert!(backup_wrap.is_none());
+    }
+
+    #[test]
+    fn portable_backup_requires_a_password_when_startup_lock_is_disabled() {
+        let key = random_data_key();
+        let config = SecurityConfig {
+            format_version: 1,
+            startup_lock_enabled: false,
+            automatic_key: Some(BASE64.encode(key)),
+            password_wrap: None,
+            recovery_wrap: None,
+        };
+
+        assert!(prepare_backup_security(&config, &key, None, false).is_err());
+        assert!(prepare_backup_security(&config, &key, Some("short".to_string()), false).is_err());
     }
 
     #[test]
@@ -1843,6 +2449,313 @@ mod tests {
             fs::read_dir(test_directory.join("images")).unwrap().count(),
             1
         );
+        fs::remove_dir_all(test_directory).unwrap();
+    }
+
+    #[test]
+    fn newly_materialized_media_reuses_the_returned_path_on_later_saves() {
+        let test_directory = test_directory("media-returned-path-test");
+        fs::create_dir_all(test_directory.join("images")).unwrap();
+        let key = random_data_key();
+        let bytes = b"\x89PNG\r\n\x1a\nnew";
+        let mut image = serde_json::json!({
+            "id": "new-image",
+            "name": "new.png",
+            "dataUrl": format!("data:image/png;base64,{}", BASE64.encode(bytes))
+        });
+
+        let first = materialize_image(&mut image, &test_directory, "images", &key, false).unwrap();
+        assert!(first.is_some());
+        assert!(image["storedPath"].as_str().is_some());
+        assert!(!image["dataUrl"].as_str().unwrap().is_empty());
+
+        let second = materialize_image(&mut image, &test_directory, "images", &key, false).unwrap();
+        assert!(second.is_none());
+        assert_eq!(
+            fs::read_dir(test_directory.join("images")).unwrap().count(),
+            1
+        );
+        fs::remove_dir_all(test_directory).unwrap();
+    }
+
+    #[test]
+    fn failed_media_batch_removes_files_created_before_the_failure() {
+        let test_directory = test_directory("media-batch-rollback-test");
+        fs::create_dir_all(test_directory.join("images")).unwrap();
+        fs::create_dir_all(test_directory.join("icons")).unwrap();
+        let key = random_data_key();
+        let mut data = serde_json::json!({
+            "services": [],
+            "accounts": [{
+                "images": [
+                    {
+                        "id": "valid",
+                        "name": "valid.png",
+                        "dataUrl": format!("data:image/png;base64,{}", BASE64.encode(b"\x89PNG\r\n\x1a\nvalid"))
+                    },
+                    {
+                        "id": "invalid",
+                        "name": "invalid.png",
+                        "dataUrl": "data:image/png;base64,bm90LWEtcG5n"
+                    }
+                ]
+            }]
+        });
+
+        assert!(materialize_media(&mut data, &test_directory, &key, false).is_err());
+        assert_eq!(
+            fs::read_dir(test_directory.join("images")).unwrap().count(),
+            0
+        );
+        fs::remove_dir_all(test_directory).unwrap();
+    }
+
+    #[test]
+    fn database_write_failure_preserves_previous_payload_and_removes_new_media() {
+        let test_directory = test_directory("database-write-rollback-test");
+        fs::create_dir_all(test_directory.join("images")).unwrap();
+        fs::create_dir_all(test_directory.join("icons")).unwrap();
+        let key = random_data_key();
+        let original = serde_json::json!({
+            "settings": { "encryptImages": false },
+            "services": [],
+            "accounts": [],
+            "marker": "original"
+        });
+        persist_app_data(original.clone(), &test_directory, &key).unwrap();
+
+        let connection = open_database(&test_directory).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_app_state_update
+                 BEFORE UPDATE OF payload ON app_state
+                 BEGIN
+                   SELECT RAISE(FAIL, 'forced database write failure');
+                 END;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let changed = serde_json::json!({
+            "settings": { "encryptImages": false },
+            "services": [],
+            "accounts": [{
+                "images": [{
+                    "id": "new-image",
+                    "name": "new.png",
+                    "dataUrl": format!("data:image/png;base64,{}", BASE64.encode(b"\x89PNG\r\n\x1a\nnew"))
+                }]
+            }],
+            "marker": "changed"
+        });
+
+        assert!(persist_app_data(changed, &test_directory, &key).is_err());
+        assert_eq!(
+            fs::read_dir(test_directory.join("images")).unwrap().count(),
+            0
+        );
+
+        let connection = open_database(&test_directory).unwrap();
+        let payload = connection
+            .query_row("SELECT payload FROM app_state WHERE id = 1", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap();
+        let (stored, was_plaintext) = decode_database_payload(&payload, &key).unwrap();
+        assert!(!was_plaintext);
+        assert_eq!(stored["marker"], "original");
+        drop(connection);
+        fs::remove_dir_all(test_directory).unwrap();
+    }
+
+    #[test]
+    fn orphan_cleanup_keeps_only_referenced_media() {
+        let test_directory = test_directory("media-cleanup-test");
+        fs::create_dir_all(test_directory.join("images")).unwrap();
+        fs::create_dir_all(test_directory.join("icons")).unwrap();
+        fs::write(test_directory.join("images/kept.png"), b"kept").unwrap();
+        fs::write(test_directory.join("images/orphan.png"), b"orphan").unwrap();
+        fs::write(test_directory.join("icons/orphan.ico"), b"orphan").unwrap();
+        let data = serde_json::json!({
+            "services": [],
+            "accounts": [{ "images": [{ "storedPath": "images/kept.png" }] }]
+        });
+
+        cleanup_orphaned_media(&data, &test_directory).unwrap();
+        assert!(test_directory.join("images/kept.png").exists());
+        assert!(!test_directory.join("images/orphan.png").exists());
+        assert!(!test_directory.join("icons/orphan.ico").exists());
+        fs::remove_dir_all(test_directory).unwrap();
+    }
+
+    #[test]
+    fn recycle_bin_media_survives_save_and_is_removed_after_permanent_delete() {
+        let test_directory = test_directory("recycle-media-test");
+        fs::create_dir_all(test_directory.join("images")).unwrap();
+        fs::create_dir_all(test_directory.join("icons")).unwrap();
+        let key = random_data_key();
+        let png = |id: &str| {
+            let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+            bytes.extend_from_slice(id.as_bytes());
+            serde_json::json!({
+                "id": id,
+                "name": format!("{id}.png"),
+                "dataUrl": format!("data:image/png;base64,{}", BASE64.encode(bytes))
+            })
+        };
+        let data = serde_json::json!({
+            "settings": { "encryptImages": true },
+            "services": [],
+            "accounts": [],
+            "recycleBin": [
+                {
+                    "id": "trash-service",
+                    "type": "service",
+                    "service": { "icon": png("trash-icon") },
+                    "accounts": [{ "images": [png("trash-service-image")] }]
+                },
+                {
+                    "id": "trash-account",
+                    "type": "account",
+                    "account": { "images": [png("trash-account-image")] }
+                }
+            ]
+        });
+
+        persist_app_data(data, &test_directory, &key).unwrap();
+        assert_eq!(
+            fs::read_dir(test_directory.join("icons")).unwrap().count(),
+            1
+        );
+        assert_eq!(
+            fs::read_dir(test_directory.join("images")).unwrap().count(),
+            2
+        );
+
+        let connection = open_database(&test_directory).unwrap();
+        let payload = connection
+            .query_row("SELECT payload FROM app_state WHERE id = 1", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap();
+        let (mut stored, _) = decode_database_payload(&payload, &key).unwrap();
+        assert_eq!(stored["recycleBin"][0]["service"]["icon"]["dataUrl"], "");
+        assert_eq!(
+            stored["recycleBin"][1]["account"]["images"][0]["dataUrl"],
+            ""
+        );
+        hydrate_media(&mut stored, &test_directory, &key, true).unwrap();
+        assert!(stored["recycleBin"][0]["service"]["icon"]["dataUrl"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+        drop(connection);
+
+        stored["recycleBin"] = serde_json::json!([]);
+        persist_app_data(stored, &test_directory, &key).unwrap();
+        assert_eq!(
+            fs::read_dir(test_directory.join("icons")).unwrap().count(),
+            0
+        );
+        assert_eq!(
+            fs::read_dir(test_directory.join("images")).unwrap().count(),
+            0
+        );
+        fs::remove_dir_all(test_directory).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn orphan_cleanup_failure_is_reported_without_rolling_back_saved_data() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let test_directory = test_directory("orphan-cleanup-warning-test");
+        fs::create_dir_all(test_directory.join("images")).unwrap();
+        fs::create_dir_all(test_directory.join("icons")).unwrap();
+        let orphan = test_directory.join("images/locked-orphan.png");
+        fs::write(&orphan, b"orphan").unwrap();
+        let lock = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&orphan)
+            .unwrap();
+        let key = random_data_key();
+        let data = serde_json::json!({
+            "settings": { "encryptImages": false },
+            "services": [],
+            "accounts": [],
+            "marker": "saved"
+        });
+
+        let result = persist_app_data(data, &test_directory, &key).unwrap();
+
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("旧图片清理失败"));
+        let connection = open_database(&test_directory).unwrap();
+        let payload = connection
+            .query_row("SELECT payload FROM app_state WHERE id = 1", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap();
+        let (stored, _) = decode_database_payload(&payload, &key).unwrap();
+        assert_eq!(stored["marker"], "saved");
+        drop(connection);
+        drop(lock);
+        fs::remove_dir_all(test_directory).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn interrupted_image_migration_is_resumable_without_data_loss() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let test_directory = test_directory("image-migration-resume-test");
+        fs::create_dir_all(test_directory.join("images")).unwrap();
+        fs::create_dir_all(test_directory.join("icons")).unwrap();
+        let first_bytes = b"\x89PNG\r\n\x1a\nfirst";
+        let second_bytes = b"\x89PNG\r\n\x1a\nsecond";
+        let first = test_directory.join("images/first.png");
+        let second = test_directory.join("images/second.png");
+        fs::write(&first, first_bytes).unwrap();
+        fs::write(&second, second_bytes).unwrap();
+        let lock = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&second)
+            .unwrap();
+        let key = random_data_key();
+        let mut data = serde_json::json!({
+            "services": [],
+            "accounts": [{
+                "images": [
+                    { "id": "first", "name": "first.png", "dataUrl": "", "storedPath": "images/first.png" },
+                    { "id": "second", "name": "second.png", "dataUrl": "", "storedPath": "images/second.png" }
+                ]
+            }]
+        });
+
+        assert!(hydrate_media(&mut data, &test_directory, &key, true).is_err());
+        assert!(fs::read(&first).unwrap().starts_with(IMAGE_ENCRYPTED_MAGIC));
+        drop(lock);
+        assert_eq!(fs::read(&second).unwrap(), second_bytes);
+
+        hydrate_media(&mut data, &test_directory, &key, true).unwrap();
+        assert_eq!(
+            decrypt_media_bytes(&key, &fs::read(&first).unwrap()).unwrap(),
+            first_bytes
+        );
+        assert_eq!(
+            decrypt_media_bytes(&key, &fs::read(&second).unwrap()).unwrap(),
+            second_bytes
+        );
+        assert!(!data["accounts"][0]["images"][0]["dataUrl"]
+            .as_str()
+            .unwrap()
+            .is_empty());
+        assert!(!data["accounts"][0]["images"][1]["dataUrl"]
+            .as_str()
+            .unwrap()
+            .is_empty());
         fs::remove_dir_all(test_directory).unwrap();
     }
 

@@ -4,12 +4,13 @@ import type {
   AccountRecord,
   AppData,
   Category,
+  RecycleBinItem,
   ServiceRecord,
   SyncEntityType,
   Tag,
 } from "../types";
 
-export const CURRENT_DATA_VERSION = 5;
+export const CURRENT_DATA_VERSION = 6;
 
 const LEGACY_DEVICE_ID = "device-legacy-migration";
 
@@ -52,6 +53,7 @@ export function createEmptyAppData(deviceId = LEGACY_DEVICE_ID, timestamp = new 
     tags: [],
     services: [],
     accounts: [],
+    recycleBin: [],
   };
 }
 
@@ -59,6 +61,8 @@ export const ALL_ACCOUNT_MODULES: AccountDisplayModule[] = [
   "username",
   "password",
   "identity",
+  "securityPhone",
+  "securityEmail",
   "security",
   "custom",
   "notes",
@@ -90,60 +94,138 @@ function normalizeModules(value: unknown): AccountDisplayModule[] {
   return ALL_ACCOUNT_MODULES.filter((item) => requested.has(item));
 }
 
+function normalizeCategoryRecord(value: Partial<Category>, index: number, deviceId: string, timestamp: string): Category {
+  return {
+    ...value,
+    id: String(value.id ?? `category-${index}`),
+    name: String(value.name ?? "未命名分类"),
+    parentId: typeof value.parentId === "string" ? value.parentId : null,
+    color: typeof value.color === "string" ? value.color : "#3f6f8f",
+    sortOrder: typeof value.sortOrder === "number" ? value.sortOrder : index,
+    ...recordVersion(value as Record<string, unknown>, deviceId, timestamp),
+  };
+}
+
+function normalizeTagRecord(value: Partial<Tag>, index: number, deviceId: string, timestamp: string): Tag {
+  return {
+    ...value,
+    id: String(value.id ?? `tag-${index}`),
+    name: String(value.name ?? "未命名标签"),
+    color: typeof value.color === "string" ? value.color : "#6b7280",
+    ...recordVersion(value as Record<string, unknown>, deviceId, timestamp),
+  };
+}
+
+function normalizeServiceRecord(value: Partial<ServiceRecord>, index: number, deviceId: string, timestamp: string): ServiceRecord {
+  return {
+    ...value,
+    id: String(value.id ?? `service-${index}`),
+    name: String(value.name ?? "未命名分区"),
+    url: String(value.url ?? ""),
+    categoryId: typeof value.categoryId === "string" ? value.categoryId : null,
+    tagIds: asArray<string>(value.tagIds),
+    icon: value.icon ?? null,
+    createdAt: String(value.createdAt ?? timestamp),
+    sortOrder: typeof value.sortOrder === "number" ? value.sortOrder : index,
+    ...recordVersion(value as Record<string, unknown>, deviceId, timestamp),
+  };
+}
+
+function normalizeAccountRecord(
+  value: Partial<AccountRecord> & { notes?: unknown },
+  index: number,
+  deviceId: string,
+  timestamp: string,
+): AccountRecord {
+  const id = String(value.id ?? `account-${index}`);
+  return {
+    ...value,
+    id,
+    serviceId: String(value.serviceId ?? ""),
+    label: String(value.label ?? "未命名账号"),
+    username: String(value.username ?? ""),
+    password: String(value.password ?? ""),
+    identityCode: String(value.identityCode ?? ""),
+    securityPhone: String(value.securityPhone ?? ""),
+    securityEmail: String(value.securityEmail ?? ""),
+    notes: normalizeNotes(value.notes, id),
+    visibleModules: normalizeModules(value.visibleModules),
+    sortOrder: typeof value.sortOrder === "number" ? value.sortOrder : index,
+    securityQuestions: asArray(value.securityQuestions),
+    customFields: asArray(value.customFields),
+    images: asArray(value.images),
+    passwordHistory: asArray(value.passwordHistory).slice(0, 3),
+    createdAt: String(value.createdAt ?? timestamp),
+    ...recordVersion(value as Record<string, unknown>, deviceId, timestamp),
+  } as AccountRecord;
+}
+
+function normalizeRecycleBin(value: unknown, deviceId: string, timestamp: string): RecycleBinItem[] {
+  return asArray<Record<string, unknown>>(value).flatMap<RecycleBinItem>((item, index) => {
+    const id = nonEmptyString(item.id, `trash-${index}`);
+    const deletedAt = nonEmptyString(item.deletedAt, timestamp);
+    const label = nonEmptyString(item.label, "未命名条目");
+    if (item.type === "category" && isObject(item.category)) {
+      const category = normalizeCategoryRecord(item.category, index, deviceId, timestamp);
+      return [{
+        id,
+        deletedAt,
+        label,
+        type: "category" as const,
+        category,
+        childCategoryIds: asArray<string>(item.childCategoryIds),
+        serviceIds: asArray<string>(item.serviceIds),
+      }];
+    }
+    if (item.type === "tag" && isObject(item.tag)) {
+      return [{
+        id,
+        deletedAt,
+        label,
+        type: "tag" as const,
+        tag: normalizeTagRecord(item.tag, index, deviceId, timestamp),
+        serviceIds: asArray<string>(item.serviceIds),
+      }];
+    }
+    if (item.type === "service" && isObject(item.service)) {
+      return [{
+        id,
+        deletedAt,
+        label,
+        type: "service" as const,
+        service: normalizeServiceRecord(item.service, index, deviceId, timestamp),
+        accounts: asArray<Partial<AccountRecord> & { notes?: unknown }>(item.accounts)
+          .map((account, accountIndex) => normalizeAccountRecord(account, accountIndex, deviceId, timestamp)),
+      }];
+    }
+    if (item.type === "account" && isObject(item.account)) {
+      return [{
+        id,
+        deletedAt,
+        label,
+        type: "account" as const,
+        serviceName: nonEmptyString(item.serviceName, "未知分区"),
+        account: normalizeAccountRecord(item.account, index, deviceId, timestamp),
+      }];
+    }
+    return [];
+  });
+}
+
 export function normalizeAppData(input: unknown, deviceId = LEGACY_DEVICE_ID): AppData {
   if (!isObject(input)) throw new Error("文件结构不正确");
   const timestamp = new Date().toISOString();
   const syncInput = isObject(input.sync) ? input.sync : {};
   const migrationDeviceId = nonEmptyString(syncInput.settingsModifiedByDeviceId, deviceId);
-  const categories = asArray<Partial<Category>>(input.categories).map((category, index) => ({
-    ...category,
-    id: String(category.id ?? `category-${index}`),
-    name: String(category.name ?? "未命名分类"),
-    parentId: typeof category.parentId === "string" ? category.parentId : null,
-    color: typeof category.color === "string" ? category.color : "#3f6f8f",
-    sortOrder: typeof category.sortOrder === "number" ? category.sortOrder : index,
-    ...recordVersion(category as Record<string, unknown>, migrationDeviceId, timestamp),
-  })) as Category[];
-  const tags = asArray<Partial<Tag>>(input.tags).map((tag, index) => ({
-    ...tag,
-    id: String(tag.id ?? `tag-${index}`),
-    name: String(tag.name ?? "未命名标签"),
-    color: typeof tag.color === "string" ? tag.color : "#6b7280",
-    ...recordVersion(tag as Record<string, unknown>, migrationDeviceId, timestamp),
-  })) as Tag[];
-  const services = asArray<Partial<ServiceRecord>>(input.services).map((service, index) => ({
-    ...service,
-    id: String(service.id ?? `service-${index}`),
-    name: String(service.name ?? "未命名分区"),
-    url: String(service.url ?? ""),
-    categoryId: typeof service.categoryId === "string" ? service.categoryId : null,
-    tagIds: asArray<string>(service.tagIds),
-    icon: service.icon ?? null,
-    createdAt: String(service.createdAt ?? new Date().toISOString()),
-    sortOrder: typeof service.sortOrder === "number" ? service.sortOrder : index,
-    ...recordVersion(service as Record<string, unknown>, migrationDeviceId, timestamp),
-  })) as ServiceRecord[];
-  const accounts = asArray<Partial<AccountRecord> & { notes?: unknown }>(input.accounts).map((account, index) => {
-    const id = String(account.id ?? `account-${index}`);
-    return {
-      ...account,
-      id,
-      serviceId: String(account.serviceId ?? ""),
-      label: String(account.label ?? "未命名账号"),
-      username: String(account.username ?? ""),
-      password: String(account.password ?? ""),
-      identityCode: String(account.identityCode ?? ""),
-      notes: normalizeNotes(account.notes, id),
-      visibleModules: normalizeModules(account.visibleModules),
-      sortOrder: typeof account.sortOrder === "number" ? account.sortOrder : index,
-      securityQuestions: asArray(account.securityQuestions),
-      customFields: asArray(account.customFields),
-      images: asArray(account.images),
-      passwordHistory: asArray(account.passwordHistory).slice(0, 3),
-      createdAt: String(account.createdAt ?? new Date().toISOString()),
-      ...recordVersion(account as Record<string, unknown>, migrationDeviceId, timestamp),
-    } as AccountRecord;
-  });
+  const categories = asArray<Partial<Category>>(input.categories)
+    .map((category, index) => normalizeCategoryRecord(category, index, migrationDeviceId, timestamp));
+  const tags = asArray<Partial<Tag>>(input.tags)
+    .map((tag, index) => normalizeTagRecord(tag, index, migrationDeviceId, timestamp));
+  const services = asArray<Partial<ServiceRecord>>(input.services)
+    .map((service, index) => normalizeServiceRecord(service, index, migrationDeviceId, timestamp));
+  const accounts = asArray<Partial<AccountRecord> & { notes?: unknown }>(input.accounts)
+    .map((account, index) => normalizeAccountRecord(account, index, migrationDeviceId, timestamp));
+  const recycleBin = normalizeRecycleBin(input.recycleBin, migrationDeviceId, timestamp);
 
   if (!Array.isArray(input.tags)) throw new Error("文件结构不正确");
   const entityTypes = new Set<SyncEntityType>(["category", "tag", "service", "account"]);
@@ -185,6 +267,7 @@ export function normalizeAppData(input: unknown, deviceId = LEGACY_DEVICE_ID): A
     tags,
     services: sortByOrder(services),
     accounts: sortByOrder(accounts),
+    recycleBin: recycleBin.sort((left, right) => right.deletedAt.localeCompare(left.deletedAt)),
   };
 }
 

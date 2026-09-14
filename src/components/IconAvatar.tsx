@@ -6,7 +6,7 @@ interface IconAvatarProps {
   image?: StoredImage | null;
   size?: "small" | "medium" | "large";
 }
-const PALETTES = ["coral", "teal", "blue", "mustard", "charcoal"] as const;
+const PALETTES = ["blue", "teal", "slate", "blue-deep", "sky"] as const;
 
 export function IconAvatar({ name, image, size = "medium" }: IconAvatarProps) {
   const seed = [...name].reduce((sum, character) => sum + character.charCodeAt(0), 0);

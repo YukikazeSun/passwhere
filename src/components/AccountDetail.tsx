@@ -33,6 +33,12 @@ interface AccountDetailProps {
   onPreviewImage: (url: string, name: string) => void;
 }
 
+export function createAccountViewKey(serviceId: Id, account: Pick<AccountRecord, "id" | "revision" | "updatedAt"> | undefined) {
+  return account
+    ? `${serviceId}:${account.id}:${account.revision}:${account.updatedAt}`
+    : `${serviceId}:none`;
+}
+
 export function AccountDetail({
   service,
   accounts,
@@ -46,9 +52,12 @@ export function AccountDetail({
   onCopy,
   onPreviewImage,
 }: AccountDetailProps) {
-  const [showPassword, setShowPassword] = useState(false);
-  const [showHistory, setShowHistory] = useState(false);
   const account = accounts.find((item) => item.id === selectedAccountId) || accounts[0];
+  const accountViewKey = createAccountViewKey(service.id, account);
+  const [revealedPasswordKey, setRevealedPasswordKey] = useState<string | null>(null);
+  const [expandedHistoryKey, setExpandedHistoryKey] = useState<string | null>(null);
+  const showPassword = revealedPasswordKey === accountViewKey;
+  const showHistory = expandedHistoryKey === accountViewKey;
   const tagIndex = new Map(tags.map((tag) => [tag.id, tag]));
 
   return (
@@ -88,8 +97,8 @@ export function AccountDetail({
             aria-selected={item.id === account?.id}
             className={item.id === account?.id ? "is-active" : ""}
             onClick={() => {
-              setShowPassword(false);
-              setShowHistory(false);
+              setRevealedPasswordKey(null);
+              setExpandedHistoryKey(null);
               onSelectAccount(item.id);
             }}
           >
@@ -115,7 +124,7 @@ export function AccountDetail({
             </div>
           </div>
 
-          {account.visibleModules.some((module) => ["username", "password", "identity"].includes(module)) ? <section className="detail-section">
+          {account.visibleModules.some((module) => ["username", "password", "identity", "securityPhone", "securityEmail"].includes(module)) ? <section className="detail-section">
             <div className="detail-section__heading">
               <UserRound size={18} />
               <h2>登录信息</h2>
@@ -126,7 +135,7 @@ export function AccountDetail({
                 <span className="field-label">当前密码</span>
                 <code className="password-value">{showPassword ? account.password : "••••••••••••"}</code>
                 <span className="field-actions">
-                  <button className="icon-button icon-button--small" onClick={() => setShowPassword((value) => !value)} title={showPassword ? "隐藏密码" : "显示密码"}>
+                  <button className="icon-button icon-button--small" onClick={() => setRevealedPasswordKey((current) => current === accountViewKey ? null : accountViewKey)} title={showPassword ? "隐藏密码" : "显示密码"}>
                     {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
                   </button>
                   <button className="icon-button icon-button--small" onClick={() => onCopy(account.password, "密码")} title="复制密码">
@@ -137,10 +146,16 @@ export function AccountDetail({
               {account.visibleModules.includes("identity") && account.identityCode ? (
                 <FieldRow label="身份识别码" value={account.identityCode} multiline onCopy={() => onCopy(account.identityCode, "身份识别码")} />
               ) : null}
+              {account.visibleModules.includes("securityPhone") && account.securityPhone ? (
+                <FieldRow label="密保手机" value={account.securityPhone} onCopy={() => onCopy(account.securityPhone || "", "密保手机")} />
+              ) : null}
+              {account.visibleModules.includes("securityEmail") && account.securityEmail ? (
+                <FieldRow label="密保邮箱" value={account.securityEmail} onCopy={() => onCopy(account.securityEmail || "", "密保邮箱")} />
+              ) : null}
             </div>
             {account.visibleModules.includes("password") && account.passwordHistory.length > 0 ? (
               <div className="history-block">
-                <button className="history-toggle" onClick={() => setShowHistory((value) => !value)}>
+                <button className="history-toggle" onClick={() => setExpandedHistoryKey((current) => current === accountViewKey ? null : accountViewKey)}>
                   <Clock3 size={15} /> 历史密码 {account.passwordHistory.length} 条
                   <span>{showHistory ? "收起" : "查看"}</span>
                 </button>

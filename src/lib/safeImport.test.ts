@@ -13,11 +13,11 @@ describe("replaceDataWithRollback", () => {
   });
 
   it("returns the rollback path after backup and save both succeed", async () => {
-    const path = await replaceDataWithRollback(createEmptyAppData(), createEmptyAppData(), {
+    const outcome = await replaceDataWithRollback(createEmptyAppData(), createEmptyAppData(), {
       createRollback: async () => "backups/rollback.anb",
-      save: async () => undefined,
+      save: async () => "saved-data",
     });
-    expect(path).toBe("backups/rollback.anb");
+    expect(outcome).toEqual({ rollbackPath: "backups/rollback.anb", result: "saved-data" });
   });
 
   it("preserves the rollback path when the atomic save fails", async () => {

@@ -1,9 +1,10 @@
-import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeftRight,
   BookKey,
   Database,
   FileClock,
+  LoaderCircle,
   Search,
   Settings as SettingsIcon,
   X,
@@ -12,21 +13,7 @@ import type { AccountRecord, AppData, AppSettings, AuditEvent, Category, Id, Imp
 import { Sidebar } from "./components/Sidebar";
 import { ServiceList } from "./components/ServiceList";
 import { AccountDetail } from "./components/AccountDetail";
-import { AccountManager } from "./components/AccountManager";
-import {
-  BackupCredentialDialog,
-  CategoryEditor,
-  DataExchangeDialog,
-  ImagePreview,
-  ImportPreviewDialog,
-  ImportResultDialog,
-  LockScreen,
-  LogsDialog,
-  PasswordDecision,
-  ServiceEditor,
-  SettingsDialog,
-  TagManager,
-} from "./components/Dialogs";
+import { LockScreen } from "./components/LockScreen";
 import {
   appendAudit,
   changeStartupPassword,
@@ -51,19 +38,57 @@ import {
   unlockVault,
 } from "./lib/storage";
 import { updatePasswordHistory } from "./lib/passwordHistory";
-import { createId, findServiceSearchResults, nowIso, validateExternalUrl, type ServiceSearchMatch } from "./lib/utils";
+import { createId, createServiceSearchIndex, findIndexedServiceSearchResults, nowIso, validateExternalUrl, type ServiceSearchMatch } from "./lib/utils";
 import { moveItem, sortByOrder, withSortOrder } from "./lib/dataModel";
 import { prepareImportData } from "./lib/importValidation";
 import { replaceDataWithRollback, SafeImportError } from "./lib/safeImport";
 import { countTagUsage, validateTags } from "./lib/tagRules";
+import { exportWithAudit } from "./lib/exportFlow";
+import { writeClipboardText } from "./lib/clipboard";
 import { describeAccountChanges, describeServiceChanges, describeTagCollectionChanges } from "./lib/audit";
-import { exportExcel, exportWord, importExcel } from "./lib/officeExchange";
 import { prepareLocalMutation } from "./lib/revisions";
 import type { SyncLocalState } from "./lib/sync";
+import type { EditorSaveResult } from "./lib/useAsyncEditorSave";
+import { useAsyncAction } from "./lib/useAsyncAction";
+import { createSerialTaskQueue } from "./lib/serialTaskQueue";
+import {
+  emptyRecycleBin,
+  permanentlyDeleteRecycleBinItem,
+  RECYCLE_BIN_TYPE_LABEL,
+  recycleAccounts,
+  recycleCategory,
+  recycleService,
+  recycleTags,
+  restoreRecycleBinItem,
+} from "./lib/recycleBin";
+
+const SettingsDialog = lazy(() => import("./components/SettingsDialog"));
+const DataExchangeDialog = lazy(() => import("./components/DataExchangeDialog"));
+const LogsDialog = lazy(() => import("./components/LogsDialog"));
+const AccountManager = lazy(() => import("./components/AccountManager").then((module) => ({ default: module.AccountManager })));
+const ServiceEditor = lazy(() => import("./components/Dialogs").then((module) => ({ default: module.ServiceEditor })));
+const PasswordDecision = lazy(() => import("./components/Dialogs").then((module) => ({ default: module.PasswordDecision })));
+const CategoryEditor = lazy(() => import("./components/Dialogs").then((module) => ({ default: module.CategoryEditor })));
+const TagManager = lazy(() => import("./components/Dialogs").then((module) => ({ default: module.TagManager })));
+const BackupCredentialDialog = lazy(() => import("./components/ImportDialogs").then((module) => ({ default: module.BackupCredentialDialog })));
+const BackupExportCredentialDialog = lazy(() => import("./components/ImportDialogs").then((module) => ({ default: module.BackupExportCredentialDialog })));
+const ImportPreviewDialog = lazy(() => import("./components/ImportDialogs").then((module) => ({ default: module.ImportPreviewDialog })));
+const ImportResultDialog = lazy(() => import("./components/ImportDialogs").then((module) => ({ default: module.ImportResultDialog })));
+const ImagePreview = lazy(() => import("./components/ImagePreview").then((module) => ({ default: module.ImagePreview })));
+
+function DialogLoadingFallback() {
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section className="modal modal--small" role="dialog" aria-modal="true" aria-label="正在加载">
+        <div className="modal-body confirm-dialog"><LoaderCircle className="spin" size={20} /><p>正在加载…</p></div>
+      </section>
+    </div>
+  );
+}
 
 type EditorState =
-  | { type: "service"; service: ServiceRecord | null }
-  | { type: "accounts" }
+  | { type: "service"; service: ServiceRecord | null; categoryId?: Id | null }
+  | { type: "accounts"; mode: "create" | "manage" }
   | { type: "category"; category: Category | null; parentId: Id | null }
   | { type: "tags" }
   | { type: "settings" }
@@ -76,6 +101,7 @@ interface PendingPasswordBatch {
   drafts: AccountRecord[];
   changedIds: Id[];
   currentIndex: number;
+  saving: boolean;
 }
 
 interface ToastMessage {
@@ -88,12 +114,16 @@ interface ProtectedBackup {
   text: string;
   fileName: string;
   createdAt: string;
+  kind: "startup" | "export";
 }
 
 interface ImportResultState {
   rollbackPath: string;
   counts: ImportCounts;
 }
+
+const MAX_EXCEL_IMPORT_BYTES = 128 * 1024 * 1024;
+const MAX_BACKUP_IMPORT_BYTES = 512 * 1024 * 1024;
 
 export default function App() {
   const [security, setSecurity] = useState<SecurityStatus | null>(null);
@@ -111,6 +141,7 @@ export default function App() {
   const [editor, setEditor] = useState<EditorState>(null);
   const [pendingPasswordBatch, setPendingPasswordBatch] = useState<PendingPasswordBatch | null>(null);
   const [protectedBackup, setProtectedBackup] = useState<ProtectedBackup | null>(null);
+  const [backupExportPrompt, setBackupExportPrompt] = useState(false);
   const [pendingImport, setPendingImport] = useState<PreparedImport | null>(null);
   const [importBusy, setImportBusy] = useState(false);
   const [importError, setImportError] = useState("");
@@ -122,6 +153,11 @@ export default function App() {
   const [imagePreview, setImagePreview] = useState<{ url: string; name: string } | null>(null);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const lastLocatedSearch = useRef("");
+  const dataRef = useRef<AppData | null>(null);
+  const [saveQueue] = useState(createSerialTaskQueue);
+  const pendingPasswordResolveRef = useRef<((result: EditorSaveResult) => void) | null>(null);
+  const { activeAction: navigationAction, runAction: runNavigationAction } = useAsyncAction<"category-delete" | "category-reorder" | "service-reorder">();
+  const { activeAction: utilityAction, runAction: runUtilityAction } = useAsyncAction<"logs" | "directory">();
 
   useEffect(() => {
     let cancelled = false;
@@ -149,13 +185,15 @@ export default function App() {
     return () => window.removeEventListener("contextmenu", disableUnusedContextMenus);
   }, []);
 
+  const serviceSearchIndex = useMemo(
+    () => data ? createServiceSearchIndex(data.accounts, data.categories, data.tags) : null,
+    [data?.accounts, data?.categories, data?.tags],
+  );
   const searchView = useMemo(() => {
-    if (!data) return { services: [], matches: new Map<Id, ServiceSearchMatch>() };
-    const results = findServiceSearchResults(
+    if (!data || !serviceSearchIndex) return { services: [], matches: new Map<Id, ServiceSearchMatch>() };
+    const results = findIndexedServiceSearchResults(
       data.services,
-      data.accounts,
-      data.categories,
-      data.tags,
+      serviceSearchIndex,
       deferredSearch,
       selectedCategoryId,
       selectedTagIds,
@@ -164,7 +202,7 @@ export default function App() {
       services: results.map((result) => result.service),
       matches: new Map(results.flatMap((result) => result.match ? [[result.service.id, result.match] as const] : [])),
     };
-  }, [data, deferredSearch, selectedCategoryId, selectedTagIds]);
+  }, [data?.services, serviceSearchIndex, deferredSearch, selectedCategoryId, selectedTagIds]);
   const filteredServices = searchView.services;
 
   useEffect(() => {
@@ -196,6 +234,7 @@ export default function App() {
   }, [data, deferredSearch, filteredServices, searchView.matches, selectedServiceId]);
 
   function applyLoadedData(loaded: AppData) {
+    dataRef.current = loaded;
     setData(loaded);
     const firstService = sortByOrder(loaded.services)[0];
     setSelectedServiceId(firstService?.id || null);
@@ -225,30 +264,34 @@ export default function App() {
     }
   }
 
-  async function persist(nextData: AppData, events?: AuditEvent | AuditEvent[], successMessage = "已保存") {
-    const previous = data;
-    if (!previous || !syncLocal) {
-      showToast("保存失败：本机设备编号尚未就绪", "error");
-      return false;
-    }
-    const versionedData = prepareLocalMutation(previous, nextData, syncLocal.deviceId);
-    setData(versionedData);
-    try {
-      await saveAppData(versionedData);
-    } catch (error) {
-      if (previous) setData(previous);
-      showToast(`保存失败：${String(error)}`, "error");
-      return false;
-    }
-    const auditEvents = events ? (Array.isArray(events) ? events : [events]) : [];
-    try {
-      for (const event of auditEvents) await appendAudit(event);
-    } catch (error) {
-      showToast(`数据已保存，但日志写入失败：${String(error)}`, "neutral");
+  function persist(update: (current: AppData) => AppData, events?: AuditEvent | AuditEvent[], successMessage = "已保存") {
+    const run = async () => {
+      const previous = dataRef.current;
+      if (!previous || !syncLocal) {
+        showToast("保存失败：本机设备编号尚未就绪", "error");
+        return false;
+      }
+      try {
+        const versionedData = prepareLocalMutation(previous, update(previous), syncLocal.deviceId);
+        const result = await saveAppData(versionedData);
+        dataRef.current = result.data;
+        setData(result.data);
+        result.warnings.forEach((warning) => showToast(warning, "neutral"));
+      } catch (error) {
+        showToast(`保存失败：${String(error)}`, "error");
+        return false;
+      }
+      const auditEvents = events ? (Array.isArray(events) ? events : [events]) : [];
+      try {
+        for (const event of auditEvents) await appendAudit(event);
+      } catch (error) {
+        showToast(`数据已保存，但日志写入失败：${String(error)}`, "neutral");
+        return true;
+      }
+      showToast(successMessage);
       return true;
-    }
-    showToast(successMessage);
-    return true;
+    };
+    return saveQueue.enqueue(run);
   }
 
   function makeEvent(action: AuditEvent["action"], serviceName: string, fields: string[], accountLabel?: string): AuditEvent {
@@ -263,101 +306,122 @@ export default function App() {
     setSelectedAccountId(matchedAccount || data?.accounts.find((account) => account.serviceId === id)?.id || null);
   }
 
-  function saveService(service: ServiceRecord) {
-    if (!data) return;
-    const previous = data.services.find((item) => item.id === service.id);
+  async function saveService(service: ServiceRecord): Promise<EditorSaveResult> {
+    const currentData = dataRef.current;
+    if (!currentData) return "failed";
+    const previous = currentData.services.find((item) => item.id === service.id);
     const exists = Boolean(previous);
-    const normalizedService = exists ? service : { ...service, sortOrder: data.services.length };
-    const nextData = {
-      ...data,
-      services: exists
-        ? data.services.map((item) => item.id === service.id ? normalizedService : item)
-        : [...data.services, normalizedService],
-    };
-    setSelectedServiceId(service.id);
-    setEditor(null);
+    const normalizedService = exists ? service : { ...service, sortOrder: currentData.services.length };
     const fields = describeServiceChanges(previous, normalizedService);
-    void persist(nextData, fields.length ? makeEvent(exists ? "修改" : "新增", service.name, fields) : undefined, exists ? "分区已更新" : "分区已创建");
+    const saved = await persist((current) => ({
+      ...current,
+      services: exists
+        ? current.services.map((item) => item.id === service.id ? normalizedService : item)
+        : [...current.services, normalizedService],
+    }), fields.length ? makeEvent(exists ? "修改" : "新增", service.name, fields) : undefined, exists ? "分区已更新" : "分区已创建");
+    if (!saved) return "failed";
+    setSelectedServiceId(service.id);
+    return "saved";
   }
 
-  function deleteService(service: ServiceRecord) {
-    if (!data) return;
-    const accountCount = data.accounts.filter((account) => account.serviceId === service.id).length;
-    if (!window.confirm(`删除“${service.name}”及其 ${accountCount} 个账号？此操作无法撤销。`)) return;
-    const nextData = {
-      ...data,
-      services: data.services.filter((item) => item.id !== service.id),
-      accounts: data.accounts.filter((account) => account.serviceId !== service.id),
-    };
-    setEditor(null);
-    setSelectedServiceId(nextData.services[0]?.id || null);
-    setSelectedAccountId(nextData.accounts.find((account) => account.serviceId === nextData.services[0]?.id)?.id || null);
-    void persist(nextData, makeEvent("删除", service.name, ["分区", `${accountCount} 个账号`]), "分区已删除");
+  async function deleteService(service: ServiceRecord): Promise<EditorSaveResult> {
+    const currentData = dataRef.current;
+    if (!currentData) return "failed";
+    const accountCount = currentData.accounts.filter((account) => account.serviceId === service.id).length;
+    if (!window.confirm(`将“${service.name}”及其 ${accountCount} 个账号移入回收站？`)) return "cancelled";
+    const trashId = createId("trash");
+    const deletedAt = nowIso();
+    const saved = await persist(
+      (current) => recycleService(current, service.id, trashId, deletedAt),
+      makeEvent("删除", service.name, ["分区移入回收站", `${accountCount} 个账号`]),
+      "分区已移入回收站",
+    );
+    if (!saved) return "failed";
+    const remainingData = dataRef.current;
+    const nextService = remainingData?.services[0];
+    setSelectedServiceId(nextService?.id || null);
+    setSelectedAccountId(remainingData?.accounts.find((account) => account.serviceId === nextService?.id)?.id || null);
+    return "saved";
   }
 
-  function saveCategory(category: Category) {
-    if (!data) return;
-    const exists = data.categories.some((item) => item.id === category.id);
-    const saved = exists ? category : { ...category, sortOrder: data.categories.length };
-    const next = {
-      ...data,
+  async function saveCategory(category: Category): Promise<EditorSaveResult> {
+    const currentData = dataRef.current;
+    if (!currentData) return "failed";
+    const exists = currentData.categories.some((item) => item.id === category.id);
+    const normalizedCategory = exists ? category : { ...category, sortOrder: currentData.categories.length };
+    const saved = await persist((current) => ({
+      ...current,
       categories: exists
-        ? data.categories.map((item) => item.id === saved.id ? saved : item)
-        : [...data.categories, saved],
-    };
-    setEditor(null);
-    void persist(next, makeEvent(exists ? "修改" : "新增", saved.name, ["分类"]), exists ? "分类已更新" : "分类已创建");
+        ? current.categories.map((item) => item.id === normalizedCategory.id ? normalizedCategory : item)
+        : [...current.categories, normalizedCategory],
+    }), makeEvent(exists ? "修改" : "新增", normalizedCategory.name, ["分类"]), exists ? "分类已更新" : "分类已创建");
+    return saved ? "saved" : "failed";
   }
 
   function deleteCategory(category: Category) {
-    if (!data) return;
-    const childCount = data.categories.filter((item) => item.parentId === category.id).length;
-    const serviceCount = data.services.filter((item) => item.categoryId === category.id).length;
-    if (!window.confirm(`删除分类“${category.name}”？其中 ${serviceCount} 个记录和 ${childCount} 个子分类将移动到上一级。`)) return;
-    const next = {
-      ...data,
-      categories: data.categories
-        .filter((item) => item.id !== category.id)
-        .map((item) => item.parentId === category.id ? { ...item, parentId: category.parentId } : item),
-      services: data.services.map((item) => item.categoryId === category.id ? { ...item, categoryId: category.parentId } : item),
-    };
-    if (selectedCategoryId === category.id) setSelectedCategoryId(category.parentId || "all");
-    void persist(next, makeEvent("删除", category.name, ["分类"]), "分类已删除");
+    void runNavigationAction("category-delete", async () => {
+      const currentData = dataRef.current;
+      if (!currentData) return;
+      const childCount = currentData.categories.filter((item) => item.parentId === category.id).length;
+      const serviceCount = currentData.services.filter((item) => item.categoryId === category.id).length;
+      if (!window.confirm(`将分类“${category.name}”移入回收站？其中 ${serviceCount} 个记录和 ${childCount} 个子分类将暂时移动到上一级。`)) return;
+      const saved = await persist(
+        (current) => recycleCategory(current, category.id, createId("trash"), nowIso()),
+        makeEvent("删除", category.name, ["分类移入回收站"]),
+        "分类已移入回收站",
+      );
+      if (saved) {
+        setSelectedCategoryId((current) => current === category.id ? category.parentId || "all" : current);
+      }
+    });
   }
 
   function reorderCategories(sourceId: Id, targetId: Id) {
-    if (!data) return;
-    const ordered = sortByOrder(data.categories);
-    const sourceIndex = ordered.findIndex((item) => item.id === sourceId);
-    const targetIndex = ordered.findIndex((item) => item.id === targetId);
-    if (sourceIndex < 0 || targetIndex < 0) return;
-    const next = withSortOrder(moveItem(ordered, sourceIndex, targetIndex));
-    void persist({ ...data, categories: next }, makeEvent("修改", "分类顺序", ["拖拽排序"]), "分类顺序已保存");
+    if (sourceId === targetId) return;
+    void runNavigationAction("category-reorder", () => persist((current) => {
+      const source = current.categories.find((item) => item.id === sourceId);
+      const target = current.categories.find((item) => item.id === targetId);
+      if (!source || !target || source.parentId !== target.parentId) return current;
+      const siblings = sortByOrder(current.categories.filter((item) => item.parentId === source.parentId));
+      const sourceIndex = siblings.findIndex((item) => item.id === sourceId);
+      const targetIndex = siblings.findIndex((item) => item.id === targetId);
+      if (sourceIndex < 0 || targetIndex < 0) return current;
+      const reordered = withSortOrder(moveItem(siblings, sourceIndex, targetIndex));
+      const orderById = new Map(reordered.map((item) => [item.id, item.sortOrder]));
+      return { ...current, categories: current.categories.map((item) => orderById.has(item.id) ? { ...item, sortOrder: orderById.get(item.id)! } : item) };
+    }, makeEvent("修改", "分类顺序", ["拖拽排序"]), "分类顺序已保存"));
   }
 
-  function saveTags(tags: Tag[]) {
-    if (!data) return;
+  async function saveTags(tags: Tag[]): Promise<EditorSaveResult> {
+    const currentData = dataRef.current;
+    if (!currentData) return "failed";
     const validation = validateTags(tags);
     if (!validation.valid) {
       showToast("标签名称不能为空或重复", "error");
-      return;
+      return "failed";
     }
     const normalizedTags = validation.normalized;
     const ids = new Set(normalizedTags.map((tag) => tag.id));
-    const next = {
-      ...data,
-      tags: normalizedTags,
-      services: data.services.map((service) => ({ ...service, tagIds: service.tagIds.filter((id) => ids.has(id)) })),
-    };
+    const fields = describeTagCollectionChanges(currentData.tags, normalizedTags, currentData.services);
+    const deletedAt = nowIso();
+    const saved = await persist((current) => {
+      const removedTags = current.tags.filter((tag) => !ids.has(tag.id));
+      const recycled = recycleTags(current, removedTags, () => createId("trash"), deletedAt);
+      return {
+        ...recycled,
+        tags: normalizedTags,
+        services: recycled.services.map((service) => ({ ...service, tagIds: service.tagIds.filter((id) => ids.has(id)) })),
+      };
+    }, fields.length ? makeEvent("修改", "标签", fields) : undefined, "标签已更新");
+    if (!saved) return "failed";
     setSelectedTagIds((current) => new Set([...current].filter((id) => ids.has(id))));
-    setEditor(null);
-    const fields = describeTagCollectionChanges(data.tags, normalizedTags, data.services);
-    void persist(next, fields.length ? makeEvent("修改", "标签", fields) : undefined, "标签已更新");
+    return "saved";
   }
 
-  function requestSaveAccounts(accounts: AccountRecord[]) {
-    if (!data) return;
-    const originals = data.accounts.filter((item) => item.serviceId === selectedServiceId);
+  function requestSaveAccounts(accounts: AccountRecord[]): Promise<EditorSaveResult> {
+    const currentData = dataRef.current;
+    if (!currentData || !selectedServiceId || pendingPasswordResolveRef.current) return Promise.resolve("failed");
+    const originals = currentData.accounts.filter((item) => item.serviceId === selectedServiceId);
     const originalIndex = new Map(originals.map((item) => [item.id, item]));
     const changedIds = accounts
       .filter((account) => {
@@ -366,19 +430,26 @@ export default function App() {
       })
       .map((account) => account.id);
     if (changedIds.length) {
-      setPendingPasswordBatch({ originals, drafts: accounts, changedIds, currentIndex: 0 });
-      return;
+      return new Promise((resolve) => {
+        pendingPasswordResolveRef.current = resolve;
+        setPendingPasswordBatch({ originals, drafts: accounts, changedIds, currentIndex: 0, saving: false });
+      });
     }
-    commitAccountSet(accounts, originals);
+    return commitAccountSet(accounts, originals);
   }
 
-  function commitPasswordUpdate(keepOld: boolean) {
-    if (!pendingPasswordBatch) return;
+  async function commitPasswordUpdate(keepOld: boolean) {
+    if (!pendingPasswordBatch || pendingPasswordBatch.saving) return;
     const { originals, drafts, changedIds, currentIndex } = pendingPasswordBatch;
     const id = changedIds[currentIndex];
     const previous = originals.find((item) => item.id === id);
     const next = drafts.find((item) => item.id === id);
-    if (!previous || !next) return;
+    if (!previous || !next) {
+      setPendingPasswordBatch(null);
+      pendingPasswordResolveRef.current?.("failed");
+      pendingPasswordResolveRef.current = null;
+      return;
+    }
     const updatedDrafts = drafts.map((account) => account.id === id ? {
       ...account,
       passwordHistory: updatePasswordHistory(previous.password, account.password, previous.passwordHistory, keepOld, account.updatedAt),
@@ -387,26 +458,36 @@ export default function App() {
       setPendingPasswordBatch({ ...pendingPasswordBatch, drafts: updatedDrafts, currentIndex: currentIndex + 1 });
       return;
     }
-    setPendingPasswordBatch(null);
-    commitAccountSet(updatedDrafts, originals);
+    setPendingPasswordBatch({ ...pendingPasswordBatch, drafts: updatedDrafts, saving: true });
+    let result: EditorSaveResult = "failed";
+    try {
+      result = await commitAccountSet(updatedDrafts, originals);
+    } catch (error) {
+      showToast(`保存失败：${String(error)}`, "error");
+    } finally {
+      setPendingPasswordBatch(null);
+      pendingPasswordResolveRef.current?.(result);
+      pendingPasswordResolveRef.current = null;
+    }
   }
 
-  function commitAccountSet(accounts: AccountRecord[], originals: AccountRecord[]) {
-    if (!data || !selectedServiceId) return;
-    const service = data.services.find((item) => item.id === selectedServiceId);
-    if (!service) return;
+  function cancelPasswordUpdate() {
+    if (pendingPasswordBatch?.saving) return;
+    setPendingPasswordBatch(null);
+    pendingPasswordResolveRef.current?.("cancelled");
+    pendingPasswordResolveRef.current = null;
+  }
+
+  async function commitAccountSet(accounts: AccountRecord[], originals: AccountRecord[]): Promise<EditorSaveResult> {
+    const currentData = dataRef.current;
+    if (!currentData || !selectedServiceId) return "failed";
+    const service = currentData.services.find((item) => item.id === selectedServiceId);
+    if (!service) return "failed";
     const originalIds = new Set(originals.map((item) => item.id));
     const nextIds = new Set(accounts.map((item) => item.id));
     const added = accounts.filter((item) => !originalIds.has(item.id)).length;
     const deleted = originals.filter((item) => !nextIds.has(item.id)).length;
     const orderedAccounts = withSortOrder(accounts);
-    const nextData = {
-      ...data,
-      services: data.services.map((item) => item.id === service.id ? { ...item, updatedAt: nowIso() } : item),
-      accounts: [...data.accounts.filter((item) => item.serviceId !== service.id), ...orderedAccounts],
-    };
-    setEditor(null);
-    setSelectedAccountId(orderedAccounts.find((item) => item.id === selectedAccountId)?.id || orderedAccounts[0]?.id || null);
     const originalById = new Map(originals.map((account) => [account.id, account]));
     const nextById = new Map(orderedAccounts.map((account) => [account.id, account]));
     const events: AuditEvent[] = [];
@@ -426,7 +507,19 @@ export default function App() {
         events.push(makeEvent("删除", service.name, fields, account.label));
       }
     }
-    void persist(nextData, events, added || deleted ? "账号清单已更新" : "账号信息已更新");
+    const deletedAt = nowIso();
+    const saved = await persist((current) => {
+      const removedAccounts = current.accounts.filter((item) => item.serviceId === service.id && !nextIds.has(item.id));
+      const recycled = recycleAccounts(current, removedAccounts, service.name, () => createId("trash"), deletedAt);
+      return {
+        ...recycled,
+        services: recycled.services.map((item) => item.id === service.id ? { ...item, updatedAt: nowIso() } : item),
+        accounts: [...recycled.accounts.filter((item) => item.serviceId !== service.id), ...orderedAccounts],
+      };
+    }, events, added || deleted ? deleted ? "账号清单已更新，删除项已移入回收站" : "账号清单已更新" : "账号信息已更新");
+    if (!saved) return "failed";
+    setSelectedAccountId(orderedAccounts.find((item) => item.id === selectedAccountId)?.id || orderedAccounts[0]?.id || null);
+    return "saved";
   }
 
   async function saveSettings(settings: AppSettings) {
@@ -442,7 +535,7 @@ export default function App() {
     if (!fields.length) return true;
     const onlyImageEncryptionChanged = settings.passwordTemplate === data.settings.passwordTemplate;
     return persist(
-      { ...data, settings },
+      (current) => ({ ...current, settings }),
       makeEvent("修改", "设置", fields),
       onlyImageEncryptionChanged
         ? settings.encryptImages ? "图片文件已加密" : "图片文件已恢复为普通格式"
@@ -450,17 +543,58 @@ export default function App() {
     );
   }
 
+  async function restoreTrashItem(itemId: Id) {
+    const item = dataRef.current?.recycleBin.find((entry) => entry.id === itemId);
+    if (!item) return false;
+    return persist(
+      (current) => {
+        const restored = restoreRecycleBinItem(current, itemId);
+        if (restored.status === "blocked") throw new Error(restored.reason);
+        return restored.data;
+      },
+      makeEvent("修改", "回收站", [`恢复${RECYCLE_BIN_TYPE_LABEL[item.type]}`]),
+      `“${item.label}”已恢复`,
+    );
+  }
+
+  async function permanentlyDeleteTrashItem(itemId: Id) {
+    const item = dataRef.current?.recycleBin.find((entry) => entry.id === itemId);
+    if (!item) return false;
+    return persist(
+      (current) => permanentlyDeleteRecycleBinItem(current, itemId),
+      makeEvent("删除", "回收站", [`永久删除${RECYCLE_BIN_TYPE_LABEL[item.type]}`]),
+      `“${item.label}”已永久删除`,
+    );
+  }
+
+  async function clearRecycleBin() {
+    const count = dataRef.current?.recycleBin.length || 0;
+    if (!count) return true;
+    return persist(
+      emptyRecycleBin,
+      makeEvent("删除", "回收站", [`清空 ${count} 个条目`]),
+      "回收站已清空",
+    );
+  }
+
   function reorderServices(sourceId: Id, targetId: Id) {
-    if (!data) return;
-    const ordered = sortByOrder(data.services);
-    const next = withSortOrder(moveItem(ordered, ordered.findIndex((item) => item.id === sourceId), ordered.findIndex((item) => item.id === targetId)));
-    void persist({ ...data, services: next }, makeEvent("修改", "记录顺序", ["拖拽排序"]), "记录顺序已保存");
+    if (sourceId === targetId) return;
+    void runNavigationAction("service-reorder", () => persist((current) => {
+      const ordered = sortByOrder(current.services);
+      const sourceIndex = ordered.findIndex((item) => item.id === sourceId);
+      const targetIndex = ordered.findIndex((item) => item.id === targetId);
+      if (sourceIndex < 0 || targetIndex < 0) return current;
+      return {
+        ...current,
+        services: withSortOrder(moveItem(ordered, sourceIndex, targetIndex)),
+      };
+    }, makeEvent("修改", "记录顺序", ["拖拽排序"]), "记录顺序已保存"));
   }
 
   async function copyValue(value: string, label: string) {
     if (!value) return;
     try {
-      await navigator.clipboard.writeText(value);
+      await writeClipboardText(value);
       showToast(`${label}已复制`);
     } catch {
       showToast("复制失败，请手动选择内容", "error");
@@ -475,22 +609,49 @@ export default function App() {
     void openExternal(url).catch((error) => showToast(`打开网址失败：${String(error)}`, "error"));
   }
 
-  async function createBackup() {
+  async function runBackupExport(credential?: string) {
     if (!data) return;
     setExchangeBusy("backup");
     setExchangeError("");
     setExchangeResult("");
     try {
-      const path = await exportBackup(data);
-      await appendAudit(makeEvent("备份", "全部数据", ["加密完整备份"]));
+      await saveQueue.waitForIdle();
+      const currentData = dataRef.current;
+      if (!currentData) throw new Error("当前数据尚未加载完成");
+      const { result: path, auditError } = await exportWithAudit(
+        () => exportBackup(currentData, credential),
+        () => appendAudit(makeEvent("备份", "全部数据", ["加密完整备份"])),
+      );
       setExchangeResult(`加密备份已创建：${path}`);
       showToast(`备份已创建：${path}`);
+      if (auditError) {
+        showToast(`备份已创建，但修改日志写入失败：${String(auditError)}`, "neutral");
+      }
     } catch (error) {
       setExchangeError(`备份失败：${String(error)}`);
       showToast(`备份失败：${String(error)}`, "error");
+      throw error;
     } finally {
       setExchangeBusy(null);
     }
+  }
+
+  async function createBackup() {
+    if (!data) return;
+    if (security && !security.startupLockEnabled) {
+      setBackupExportPrompt(true);
+      return;
+    }
+    try {
+      await runBackupExport();
+    } catch {
+      // The export flow already presents the failure through the exchange panel and toast.
+    }
+  }
+
+  async function submitBackupExportCredential(credential: string) {
+    await runBackupExport(credential);
+    setBackupExportPrompt(false);
   }
 
   async function importBackup(file?: File) {
@@ -500,16 +661,19 @@ export default function App() {
     setExchangeResult("");
     try {
       if (file.name.toLowerCase().endsWith(".xlsx")) {
+        if (file.size > MAX_EXCEL_IMPORT_BYTES) throw new Error("Excel 文件超过 128 MB 限制");
+        const { importExcel } = await import("./lib/officeExchange");
         setPendingImport(await importExcel(await file.arrayBuffer(), file.name, file.lastModified));
         setImportError("");
         setEditor(null);
         return;
       }
+      if (file.size > MAX_BACKUP_IMPORT_BYTES) throw new Error("备份文件超过 512 MB 限制");
       const text = await file.text();
       try {
         const info = await inspectBackup(text);
-        if (info.startupLockEnabled) {
-          setProtectedBackup({ text, fileName: file.name, createdAt: info.createdAt });
+        if (info.requiresCredential) {
+          setProtectedBackup({ text, fileName: file.name, createdAt: info.createdAt, kind: info.startupLockEnabled ? "startup" : "export" });
         } else {
           setPendingImport(prepareImportData(await decryptBackup(text), {
             fileName: file.name,
@@ -541,14 +705,23 @@ export default function App() {
     setExchangeError("");
     setExchangeResult("");
     try {
+      await saveQueue.waitForIdle();
+      const currentData = dataRef.current;
+      if (!currentData) throw new Error("当前数据尚未加载完成");
+      const { exportExcel, exportWord } = await import("./lib/officeExchange");
       const timestamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
       const fileName = `account-notebook-${timestamp}.${kind === "excel" ? "xlsx" : "docx"}`;
-      const bytes = kind === "excel" ? await exportExcel(data) : await exportWord(data);
-      const path = await saveOfficeExport(fileName, bytes);
+      const bytes = kind === "excel" ? await exportExcel(currentData) : await exportWord(currentData);
       const label = kind === "excel" ? "标准 Excel" : "只读 Word";
-      await appendAudit(makeEvent("备份", "全部数据", [`导出${label}`]));
+      const { result: path, auditError } = await exportWithAudit(
+        () => saveOfficeExport(fileName, bytes),
+        () => appendAudit(makeEvent("备份", "全部数据", [`导出${label}`])),
+      );
       setExchangeResult(`${label} 已导出：${path}`);
       showToast(`${label} 已导出`);
+      if (auditError) {
+        showToast(`${label} 已导出，但修改日志写入失败：${String(auditError)}`, "neutral");
+      }
     } catch (error) {
       setExchangeError(`导出失败：${String(error)}`);
       showToast(`导出失败：${String(error)}`, "error");
@@ -574,11 +747,18 @@ export default function App() {
     setImportBusy(true);
     setImportError("");
     let rollbackPath: string;
+    let importedData: AppData;
     try {
-      rollbackPath = await replaceDataWithRollback(data, pendingImport.data, {
+      await saveQueue.waitForIdle();
+      const currentData = dataRef.current;
+      if (!currentData) throw new Error("当前数据尚未加载完成");
+      const outcome = await replaceDataWithRollback(currentData, pendingImport.data, {
         createRollback: createRollbackBackup,
         save: saveAppData,
       });
+      rollbackPath = outcome.rollbackPath;
+      importedData = outcome.result.data;
+      outcome.result.warnings.forEach((warning) => showToast(warning, "neutral"));
     } catch (error) {
       const failure = error instanceof SafeImportError ? error : new SafeImportError("save", String(error));
       setImportError(failure.stage === "backup"
@@ -591,7 +771,7 @@ export default function App() {
     const completed = pendingImport;
     setSelectedCategoryId("all");
     setSelectedTagIds(new Set());
-    applyLoadedData(completed.data);
+    applyLoadedData(importedData);
     setPendingImport(null);
     setImportResult({ rollbackPath, counts: completed.counts });
     setImportBusy(false);
@@ -604,12 +784,24 @@ export default function App() {
   }
 
   async function openLogs() {
-    try {
-      setLogs(await readAuditLogs());
-      setEditor({ type: "logs" });
-    } catch (error) {
-      showToast(`日志读取失败：${String(error)}`, "error");
-    }
+    await runUtilityAction("logs", async () => {
+      try {
+        setLogs(await readAuditLogs());
+        setEditor({ type: "logs" });
+      } catch (error) {
+        showToast(`日志读取失败：${String(error)}`, "error");
+      }
+    });
+  }
+
+  async function openDataDirectory() {
+    await runUtilityAction("directory", async () => {
+      try {
+        showToast(await revealDataDirectory(), "neutral");
+      } catch (error) {
+        showToast(`数据目录打开失败：${String(error)}`, "error");
+      }
+    });
   }
 
   async function refreshSecurity() {
@@ -663,6 +855,25 @@ export default function App() {
     showToast("启动密码已关闭");
   }
 
+  async function handleLockVault() {
+    await saveQueue.waitForIdle();
+    await lockVault();
+    dataRef.current = null;
+    setData(null);
+    setEditor(null);
+    setSecurity((current) => current ? { ...current, unlocked: false, requiresPasswordChange: false } : current);
+    try {
+      await refreshSecurity();
+    } catch (error) {
+      showToast(`已锁定，但状态刷新失败：${String(error)}`, "neutral");
+    }
+  }
+
+  async function handleOpenAuditLog() {
+    const message = await openAuditLog();
+    showToast(message, "neutral");
+  }
+
   if (bootError) {
     return <div className="loading-screen loading-screen--error"><BookKey size={28} /><strong>无法打开数据</strong><span>{bootError}</span></div>;
   }
@@ -685,13 +896,13 @@ export default function App() {
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div className="brand"><span><img src="/favicon.png" alt="" /></span><div><strong>我密码呢</strong><small>本地账号信息记事本</small></div></div>
         <label className="search-box"><Search size={17} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索软件、账号、备注或标签" />{search ? <button onClick={() => setSearch("")} title="清空搜索"><X size={15} /></button> : null}</label>
+        <strong className="topbar-motto">别问，问就是忘了</strong>
         <div className="topbar-actions">
-          <button className="icon-button" onClick={() => { setExchangeError(""); setExchangeResult(""); setEditor({ type: "exchange" }); }} title="数据交换"><ArrowLeftRight size={18} /></button>
-          <button className="icon-button" onClick={() => void openLogs()} title="查看修改日志"><FileClock size={18} /></button>
-          <button className="icon-button" onClick={() => void revealDataDirectory().then((message) => showToast(message, "neutral"))} title="打开数据目录"><Database size={18} /></button>
-          <button className="icon-button" onClick={() => setEditor({ type: "settings" })} title="设置"><SettingsIcon size={18} /></button>
+          <button className="icon-button" disabled={utilityAction !== null} onClick={() => { setExchangeError(""); setExchangeResult(""); setEditor({ type: "exchange" }); }} title="数据交换"><ArrowLeftRight size={18} /></button>
+          <button className="icon-button" disabled={utilityAction !== null} onClick={() => void openLogs()} title="查看修改日志">{utilityAction === "logs" ? <LoaderCircle className="spin" size={18} /> : <FileClock size={18} />}</button>
+          <button className="icon-button" disabled={utilityAction !== null} onClick={() => void openDataDirectory()} title="打开数据目录">{utilityAction === "directory" ? <LoaderCircle className="spin" size={18} /> : <Database size={18} />}</button>
+          <button className="icon-button" disabled={utilityAction !== null} onClick={() => setEditor({ type: "settings" })} title="设置"><SettingsIcon size={18} /></button>
         </div>
       </header>
 
@@ -700,6 +911,7 @@ export default function App() {
           categories={data.categories}
           tags={data.tags}
           services={data.services}
+          accounts={data.accounts}
           selectedCategoryId={selectedCategoryId}
           selectedTagIds={selectedTagIds}
           onCategoryChange={setSelectedCategoryId}
@@ -712,9 +924,10 @@ export default function App() {
           onRenameCategory={(category) => setEditor({ type: "category", category, parentId: category.parentId })}
           onDeleteCategory={deleteCategory}
           onReorderCategory={reorderCategories}
+          mutationBusy={navigationAction !== null}
           onManageTags={() => setEditor({ type: "tags" })}
         />
-        <ServiceList services={filteredServices} accounts={data.accounts} categories={data.categories} tags={data.tags} searchMatches={searchView.matches} searchActive={Boolean(deferredSearch.trim())} selectedServiceId={selectedServiceId} onSelect={selectService} onAdd={() => setEditor({ type: "service", service: null })} onReorder={reorderServices} />
+        <ServiceList services={filteredServices} accounts={data.accounts} categories={data.categories} tags={data.tags} searchMatches={searchView.matches} searchActive={Boolean(deferredSearch.trim())} reorderBusy={navigationAction !== null} selectedServiceId={selectedServiceId} onSelect={selectService} onAdd={() => setEditor({ type: "service", service: null, categoryId: selectedCategoryId === "all" ? null : selectedCategoryId })} onReorder={reorderServices} />
         {selectedService ? (
           <AccountDetail
             key={`${selectedService.id}:${selectedAccountId || "none"}`}
@@ -723,30 +936,33 @@ export default function App() {
             tags={data.tags}
             selectedAccountId={selectedAccountId}
             onSelectAccount={setSelectedAccountId}
-            onAddAccount={() => setEditor({ type: "accounts" })}
-            onEditAccount={() => setEditor({ type: "accounts" })}
+            onAddAccount={() => setEditor({ type: "accounts", mode: "create" })}
+            onEditAccount={() => setEditor({ type: "accounts", mode: "manage" })}
             onEditService={() => setEditor({ type: "service", service: selectedService })}
             onOpenUrl={openUrl}
             onCopy={(value, label) => void copyValue(value, label)}
             onPreviewImage={(url, name) => setImagePreview({ url, name })}
           />
         ) : (
-          <main className="empty-workspace"><BookKey size={32} /><strong>{filteredServices.length === 0 && data.services.length > 0 ? "没有匹配的记录" : "开始建立账号记录"}</strong><span>{data.services.length > 0 ? "调整筛选条件，或新建一个分区" : "先建立一个软件或网站分区"}</span><button className="button button--primary" onClick={() => setEditor({ type: "service", service: null })}>新建分区</button></main>
+          <main className="empty-workspace"><BookKey size={32} /><strong>{filteredServices.length === 0 && data.services.length > 0 ? "没有匹配的记录" : "开始建立账号记录"}</strong><span>{data.services.length > 0 ? "调整筛选条件，或新建一个分区" : "先建立一个软件或网站分区"}</span><button className="button button--primary" onClick={() => setEditor({ type: "service", service: null, categoryId: selectedCategoryId === "all" ? null : selectedCategoryId })}>新建分区</button></main>
         )}
       </div>
 
-      {editor?.type === "service" ? <ServiceEditor service={editor.service} categories={data.categories} tags={data.tags} onClose={() => setEditor(null)} onSave={saveService} onDelete={editor.service ? () => deleteService(editor.service!) : undefined} /> : null}
-      {editor?.type === "accounts" && selectedService ? <AccountManager key={selectedService.id} accounts={selectedAccounts} serviceId={selectedService.id} serviceName={selectedService.name} passwordTemplate={data.settings.passwordTemplate} initialAccountId={selectedAccountId} onClose={() => setEditor(null)} onSave={requestSaveAccounts} /> : null}
-      {editor?.type === "category" ? <CategoryEditor category={editingCategory} parentId={editingParentId} parentName={parentName} onClose={() => setEditor(null)} onSave={saveCategory} /> : null}
-      {editor?.type === "tags" ? <TagManager initialTags={data.tags} usageCounts={countTagUsage(data.services)} onClose={() => setEditor(null)} onSave={saveTags} /> : null}
-      {editor?.type === "settings" ? <SettingsDialog status={security} passwordTemplate={data.settings.passwordTemplate} encryptImages={data.settings.encryptImages} onClose={() => setEditor(null)} onEnable={handleEnableStartupLock} onChange={handleChangeStartupPassword} onRegenerate={handleRegenerateRecoveryCode} onDisable={handleDisableStartupLock} onLock={async () => { await lockVault(); setData(null); setEditor(null); await refreshSecurity(); }} onLoadStats={getStorageStats} onSaveSettings={saveSettings} /> : null}
-      {editor?.type === "exchange" ? <DataExchangeDialog busyAction={exchangeBusy} result={exchangeResult} error={exchangeError} onClose={() => setEditor(null)} onBackup={() => void createBackup()} onImport={(file) => void importBackup(file)} onExportExcel={() => void createOfficeExport("excel")} onExportWord={() => void createOfficeExport("word")} /> : null}
-      {editor?.type === "logs" ? <LogsDialog logs={logs} onClose={() => setEditor(null)} onOpenFile={() => void openAuditLog().then((message) => showToast(message, "neutral"))} /> : null}
-      {protectedBackup ? <BackupCredentialDialog onClose={() => setProtectedBackup(null)} onSubmit={unlockProtectedBackup} /> : null}
-      {pendingImport ? <ImportPreviewDialog preview={pendingImport} busy={importBusy} error={importError} onClose={() => { if (!importBusy) { setPendingImport(null); setImportError(""); } }} onConfirm={() => void confirmImport()} /> : null}
-      {importResult ? <ImportResultDialog rollbackPath={importResult.rollbackPath} counts={importResult.counts} onClose={() => setImportResult(null)} onOpenDirectory={() => void revealDataDirectory().then((message) => showToast(message, "neutral"))} /> : null}
-      {pendingPasswordBatch ? (() => { const id = pendingPasswordBatch.changedIds[pendingPasswordBatch.currentIndex]; const previous = pendingPasswordBatch.originals.find((item) => item.id === id)!; const next = pendingPasswordBatch.drafts.find((item) => item.id === id)!; return <PasswordDecision accountLabel={next.label} oldPassword={previous.password} newPassword={next.password} onCancel={() => setPendingPasswordBatch(null)} onConfirm={commitPasswordUpdate} />; })() : null}
-      {imagePreview ? <ImagePreview {...imagePreview} onClose={() => setImagePreview(null)} /> : null}
+      <Suspense fallback={<DialogLoadingFallback />}>
+        {editor?.type === "service" ? <ServiceEditor service={editor.service} initialCategoryId={editor.categoryId} categories={data.categories} tags={data.tags} onClose={() => setEditor(null)} onSave={saveService} onDelete={editor.service ? () => deleteService(editor.service!) : undefined} /> : null}
+        {editor?.type === "accounts" && selectedService ? <AccountManager key={`${selectedService.id}:${editor.mode}`} accounts={selectedAccounts} serviceId={selectedService.id} serviceName={selectedService.name} passwordTemplate={data.settings.passwordTemplate} initialAccountId={selectedAccountId} openMode={editor.mode} onClose={() => setEditor(null)} onSave={requestSaveAccounts} /> : null}
+        {editor?.type === "category" ? <CategoryEditor category={editingCategory} parentId={editingParentId} parentName={parentName} onClose={() => setEditor(null)} onSave={saveCategory} /> : null}
+        {editor?.type === "tags" ? <TagManager initialTags={data.tags} usageCounts={countTagUsage(data.services)} onClose={() => setEditor(null)} onSave={saveTags} /> : null}
+        {editor?.type === "settings" ? <SettingsDialog status={security} passwordTemplate={data.settings.passwordTemplate} encryptImages={data.settings.encryptImages} recycleBin={data.recycleBin} onClose={() => setEditor(null)} onEnable={handleEnableStartupLock} onChange={handleChangeStartupPassword} onRegenerate={handleRegenerateRecoveryCode} onDisable={handleDisableStartupLock} onLock={handleLockVault} onLoadStats={getStorageStats} onSaveSettings={saveSettings} onRestoreTrash={restoreTrashItem} onDeleteTrash={permanentlyDeleteTrashItem} onEmptyTrash={clearRecycleBin} /> : null}
+        {editor?.type === "exchange" ? <DataExchangeDialog busyAction={exchangeBusy} result={exchangeResult} error={exchangeError} onClose={() => setEditor(null)} onBackup={() => void createBackup()} onImport={(file) => void importBackup(file)} onExportExcel={() => void createOfficeExport("excel")} onExportWord={() => void createOfficeExport("word")} /> : null}
+        {editor?.type === "logs" ? <LogsDialog logs={logs} onClose={() => setEditor(null)} onOpenFile={handleOpenAuditLog} /> : null}
+        {protectedBackup ? <BackupCredentialDialog kind={protectedBackup.kind} onClose={() => setProtectedBackup(null)} onSubmit={unlockProtectedBackup} /> : null}
+        {backupExportPrompt ? <BackupExportCredentialDialog onClose={() => { if (!exchangeBusy) setBackupExportPrompt(false); }} onSubmit={submitBackupExportCredential} /> : null}
+        {pendingImport ? <ImportPreviewDialog preview={pendingImport} busy={importBusy} error={importError} onClose={() => { if (!importBusy) { setPendingImport(null); setImportError(""); } }} onConfirm={() => void confirmImport()} /> : null}
+        {importResult ? <ImportResultDialog rollbackPath={importResult.rollbackPath} counts={importResult.counts} onClose={() => setImportResult(null)} onOpenDirectory={openDataDirectory} /> : null}
+        {pendingPasswordBatch ? (() => { const id = pendingPasswordBatch.changedIds[pendingPasswordBatch.currentIndex]; const previous = pendingPasswordBatch.originals.find((item) => item.id === id)!; const next = pendingPasswordBatch.drafts.find((item) => item.id === id)!; return <PasswordDecision accountLabel={next.label} oldPassword={previous.password} newPassword={next.password} busy={pendingPasswordBatch.saving} onCancel={cancelPasswordUpdate} onConfirm={(keepOld) => void commitPasswordUpdate(keepOld)} />; })() : null}
+        {imagePreview ? <ImagePreview {...imagePreview} onClose={() => setImagePreview(null)} /> : null}
+      </Suspense>
 
       <div className="toast-stack" aria-live="polite">{toasts.map((toast) => <button key={toast.id} className={`toast toast--${toast.tone}`} onClick={() => setToasts((current) => current.filter((item) => item.id !== toast.id))}>{toast.message}</button>)}</div>
     </div>

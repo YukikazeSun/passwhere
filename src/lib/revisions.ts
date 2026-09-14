@@ -62,7 +62,8 @@ function stampRecords<T extends VersionedRecord>(
       modifiedByDeviceId: existing.modifiedByDeviceId,
     };
   });
-  const deleted = previous.filter((item) => !next.some((candidate) => candidate.id === item.id));
+  const nextIds = new Set(next.map((item) => item.id));
+  const deleted = previous.filter((item) => !nextIds.has(item.id));
   if (deleted.length) changed = true;
   const tombstones: DeletionTombstone[] = deleted.map((item) => ({
     entityType,

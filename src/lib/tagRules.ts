@@ -1,4 +1,4 @@
-import type { Id, ServiceRecord, Tag } from "../types";
+import type { AccountRecord, Id, ServiceRecord, Tag } from "../types";
 
 export interface TagValidationResult {
   valid: boolean;
@@ -30,6 +30,23 @@ export function countTagUsage(services: ServiceRecord[]) {
   for (const service of services) {
     for (const tagId of new Set(service.tagIds)) {
       counts[tagId] = (counts[tagId] || 0) + 1;
+    }
+  }
+  return counts;
+}
+
+/** Counts account records attached to each tag's service partition. */
+export function countTagAccountUsage(services: ServiceRecord[], accounts: AccountRecord[]) {
+  const accountsByService = new Map<Id, number>();
+  for (const account of accounts) {
+    accountsByService.set(account.serviceId, (accountsByService.get(account.serviceId) || 0) + 1);
+  }
+
+  const counts: Record<Id, number> = {};
+  for (const service of services) {
+    const accountCount = accountsByService.get(service.id) || 0;
+    for (const tagId of new Set(service.tagIds)) {
+      counts[tagId] = (counts[tagId] || 0) + accountCount;
     }
   }
   return counts;
